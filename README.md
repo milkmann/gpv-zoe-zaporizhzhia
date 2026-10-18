@@ -1,11 +1,13 @@
-# ⚡ GPV ZOE Zaporizhzhia — Дані графіків відключень для Запоріжжя
+# ⚡ GPV ZOE Zaporizhzhia — Дані та наочні графіки відключень для Запоріжжя
 
 [![Update Outage Data](https://github.com/milkmann/gpv-zoe-zaporizhzhia/actions/workflows/update.yml/badge.svg)](https://github.com/milkmann/gpv-zoe-zaporizhzhia/actions/workflows/update.yml)
 
 Автоматичний парсер та генератор актуальних даних погодинних відключень електроенергії (ГПВ) для споживачів міста **Запоріжжя та області**, що агрегує публікації з офіційного вебресурсу ПАТ «Запоріжжяобленерго» ([zoe.com.ua/outage](https://www.zoe.com.ua/outage/)).
 
-Вихідний розклад формується у стандартизованій структурі JSON (схема DTEK / OE), розробленій для прямої сумісності з модулями розумного дому, зокрема з популярною інтеграцією Home Assistant:
-👉 **[ALERTua/ha-svitlo-yeah (Світло Є)](https://github.com/ALERTua/ha-svitlo-yeah)**.
+Вихідний розклад формується у двох форматах:
+1. **Стандартизований JSON** (схема DTEK / OE) — для повної сумісності з популярною інтеграцією Home Assistant:
+   👉 **[ALERTua/ha-svitlo-yeah (Світло Є)](https://github.com/ALERTua/ha-svitlo-yeah)**.
+2. **Наочні графічні таблиці (PNG)** — для зручного перегляду з телефону, публікації в Telegram або відображення на настінних екранах/віджетах.
 
 ---
 
@@ -14,6 +16,21 @@
 ```text
 https://github.com/milkmann/gpv-zoe-zaporizhzhia/raw/main/data/Zaporizhzhiaoblenergo.json
 ```
+
+---
+
+## 🖼️ Наочні графічні розклади (PNG)
+
+Таблиці генеруються автоматично на основі останнього опублікованого графіку:
+
+* **Зведена таблиця всіх черг на сьогодні:** [gpv-all-today.png](https://raw.githubusercontent.com/milkmann/gpv-zoe-zaporizhzhia/main/images/Zaporizhzhiaoblenergo/gpv-all-today.png)
+* **Графіки за чергами (сьогодні + завтра):**
+  - [Черга 1.1](https://raw.githubusercontent.com/milkmann/gpv-zoe-zaporizhzhia/main/images/Zaporizhzhiaoblenergo/gpv-1-1-emergency.png) | [Черга 1.2](https://raw.githubusercontent.com/milkmann/gpv-zoe-zaporizhzhia/main/images/Zaporizhzhiaoblenergo/gpv-1-2-emergency.png)
+  - [Черга 2.1](https://raw.githubusercontent.com/milkmann/gpv-zoe-zaporizhzhia/main/images/Zaporizhzhiaoblenergo/gpv-2-1-emergency.png) | [Черга 2.2](https://raw.githubusercontent.com/milkmann/gpv-zoe-zaporizhzhia/main/images/Zaporizhzhiaoblenergo/gpv-2-2-emergency.png)
+  - [Черга 3.1](https://raw.githubusercontent.com/milkmann/gpv-zoe-zaporizhzhia/main/images/Zaporizhzhiaoblenergo/gpv-3-1-emergency.png) | [Черга 3.2](https://raw.githubusercontent.com/milkmann/gpv-zoe-zaporizhzhia/main/images/Zaporizhzhiaoblenergo/gpv-3-2-emergency.png)
+  - [Черга 4.1](https://raw.githubusercontent.com/milkmann/gpv-zoe-zaporizhzhia/main/images/Zaporizhzhiaoblenergo/gpv-4-1-emergency.png) | [Черга 4.2](https://raw.githubusercontent.com/milkmann/gpv-zoe-zaporizhzhia/main/images/Zaporizhzhiaoblenergo/gpv-4-2-emergency.png)
+  - [Черга 5.1](https://raw.githubusercontent.com/milkmann/gpv-zoe-zaporizhzhia/main/images/Zaporizhzhiaoblenergo/gpv-5-1-emergency.png) | [Черга 5.2](https://raw.githubusercontent.com/milkmann/gpv-zoe-zaporizhzhia/main/images/Zaporizhzhiaoblenergo/gpv-5-2-emergency.png)
+  - [Черга 6.1](https://raw.githubusercontent.com/milkmann/gpv-zoe-zaporizhzhia/main/images/Zaporizhzhiaoblenergo/gpv-6-1-emergency.png) | [Черга 6.2](https://raw.githubusercontent.com/milkmann/gpv-zoe-zaporizhzhia/main/images/Zaporizhzhiaoblenergo/gpv-6-2-emergency.png)
 
 ---
 
@@ -28,21 +45,25 @@ flowchart TD
     subgraph GHA["⚙️ 2. Хмарний пайплайн (GitHub Actions)"]
         CRON["Планувальник<br/>(запуск кожні 15 хвилин)"] --> RUN["scripts/parser.py"]
         ZOE -.->|HTML-публікації| RUN
-        RUN --> LOGIC["Обробка логіки:<br/>• 12 підчерг (GPV 1.1 — 6.2)<br/>• 30-хв слоти (first / second)<br/>• Дні без відключень (yes)"]
-        LOGIC --> CHECK{"Дані змінилися?"}
-        CHECK -- Так --> COMMIT["Автоматичний комміт<br/>в data/Zaporizhzhiaoblenergo.json"]
+        RUN --> PNG["scripts/render_png.py<br/>Генерація наочних PNG-таблиць"]
+        PNG --> CHECK{"Дані змінилися?"}
+        CHECK -- Так --> COMMIT["Автоматичний комміт<br/>data/ та images/"]
         CHECK -- Ні --> IDLE["Пропуск (без зайвих коммітів)"]
     end
 
     subgraph STORE["📦 3. Хмарне сховище"]
-        RAW["GitHub Raw JSON<br/>(milkmann/gpv-zoe-zaporizhzhia)"]
+        RAW["GitHub Raw JSON<br/>(Zaporizhzhiaoblenergo.json)"]
+        IMGS["Графічні таблиці PNG<br/>(gpv-*.png)"]
         COMMIT --> RAW
+        COMMIT --> IMGS
     end
 
-    subgraph HA["🏠 4. Розумний дім"]
-        INT["Інтеграція Svitlo Yeah<br/>(ALERTua/ha-svitlo-yeah)"]
+    subgraph CLIENTS["🏠 4. Споживачі"]
+        INT["Home Assistant (ha-svitlo-yeah)"]
+        TG["Telegram-боти, сповіщення, віджети"]
         RAW -.->|HTTP GET| INT
-        INT --> DASH["Дашборди, графіки, календарі<br/>та автоматизації в Home Assistant"]
+        IMGS -.->|Пряме посилання| TG
+        INT --> DASH["Дашборди, графіки, календарі"]
     end
 ```
 
@@ -62,7 +83,7 @@ flowchart TD
 5. **Коректна обробка періодів без обмежень:**
    - Якщо офіційно повідомлено про відсутність застосування графіків для населення, слоти заповнюються значенням `yes` («Світло є»), запобігаючи неправдивим тривогам або зависанню застарілих даних.
 6. **Автономність та стійкість:**
-   - Рішення реалізовано на вбудованих бібліотеках Python 3 без зовнішніх пакетів.
+   - Рішення реалізовано на Python 3 з автоматичним кешуванням хешів.
    - У випадку мережевих збоїв або тимчасової недоступності сайту-джерела наявний стан зберігається без руйнування JSON-файлу.
 
 ---
