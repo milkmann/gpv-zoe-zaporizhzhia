@@ -1,0 +1,44 @@
+name: Update Outage Data
+
+on:
+  schedule:
+    # Run every 15 minutes
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'scripts/parser.py'
+
+permissions:
+  contents: write
+
+jobs:
+  update-schedule:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run parser
+        run: |
+          python scripts/parser.py
+
+      - name: Commit and push if changed
+        run: |
+          if git diff --quiet data/Zaporizhzhiaoblenergo.json; then
+            echo "No changes in outage data."
+          else
+            echo "Outage data changed. Committing..."
+            git config --local user.name "github-actions[bot]"
+            git config --local user.email "github-actions[bot]@users.noreply.github.com"
+            git add data/Zaporizhzhiaoblenergo.json
+            git commit -m "Update $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            git push
+          fi
