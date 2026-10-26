@@ -47,11 +47,33 @@ DEFAULT_TIME_TYPE = {
     "maybe": "Можливе відключення",
     "no": "Відключення",
     "first": "Відключення перші 30 хв.",
-    "second": "Відключення другі 30 хв."
+    "second": "Відключення другі 30 хв.",
+    "mfirst": "Можливе відключення перші 30 хв.",
+    "msecond": "Можливе відключення другі 30 хв."
 }
 
 URL_ZOE_OUTAGE = "https://www.zoe.com.ua/outage/"
 FALLBACK_URL = "https://raw.githubusercontent.com/yaroslav2901/OE_OUTAGE_DATA/main/data/Zaporizhzhiaoblenergo.json"
+
+
+def parse_update_datetime(upd_str: str | None) -> datetime | None:
+    """Parse update date/time string in various formats to timezone-aware datetime."""
+    if not upd_str or not isinstance(upd_str, str):
+        return None
+    cleaned = upd_str.strip()
+    for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(cleaned, fmt).replace(tzinfo=TZ_KYIV)
+        except ValueError:
+            pass
+    try:
+        dt = datetime.fromisoformat(cleaned)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TZ_KYIV)
+        return dt.astimezone(TZ_KYIV)
+    except Exception:
+        pass
+    return None
 
 
 def fetch_fallback_data() -> tuple[dict, str | None] | None:
@@ -180,7 +202,13 @@ def parse_outages_from_html(html: str) -> tuple[dict, str | None]:
             continue
 
         month_num = MONTHS_UA[month_name]
-        target_date = datetime(year, month_num, day_num, 0, 0, tzinfo=TZ_KYIV)
+        article_year = year
+        if now_kyiv.month == 12 and month_num == 1:
+            article_year = year + 1
+        elif now_kyiv.month == 1 and month_num == 12:
+            article_year = year - 1
+
+        target_date = datetime(article_year, month_num, day_num, 0, 0, tzinfo=TZ_KYIV)
         day_ts = str(int(target_date.timestamp()))
 
         # If already parsed a newer article for this day, skip earlier updates
@@ -199,7 +227,7 @@ def parse_outages_from_html(html: str) -> tuple[dict, str | None]:
             if not upd_match:
                 upd_match = re.search(r"(?:станом на|опубліковано|час[:\s]+)\s*(\d{1,2}:\d{2})", clean_body, re.IGNORECASE)
             upd_time = upd_match.group(1) if upd_match else now_kyiv.strftime("%H:%M")
-            update_dt = f"{day_num:02d}.{month_num:02d}.{year} {upd_time}"
+            update_dt = f"{day_num:02d}.{month_num:02d}.{article_year} {upd_time}"
 
             if latest_update_str is None:
                 latest_update_str = update_dt
@@ -229,7 +257,7 @@ def parse_outages_from_html(html: str) -> tuple[dict, str | None]:
                 days_data[day_ts] = day_queues
                 print(f"[OK] Parsed NO outages for population on {target_date.strftime('%Y-%m-%d')}")
                 if latest_update_str is None:
-                    latest_update_str = f"{day_num:02d}.{month_num:02d}.{year} {now_kyiv.strftime('%H:%M')}"
+                    latest_update_str = f"{day_num:02d}.{month_num:02d}.{article_year} {now_kyiv.strftime('%H:%M')}"
 
     return days_data, latest_update_str
 
@@ -296,7 +324,15 @@ def main():
         print("[INFO] Attempting fallback data source...")
         fallback = fetch_fallback_data()
         if fallback:
-            days_data, update_str = fallback
+            fb_days, fb_update = fallback
+            existing_upd_str = existing_data.get("fact", {}).get("update") if existing_data else None
+            fb_dt = parse_update_datetime(fb_update)
+            ex_dt = parse_update_datetime(existing_upd_str)
+
+            if ex_dt and fb_dt and fb_dt <= ex_dt:
+                print(f"[WARN] Fallback update ({fb_update}) is not newer than local file ({existing_upd_str}). Fallback rejected.")
+            else:
+                days_data, update_str = fb_days, fb_update
 
     if not days_data:
         print("[WARN] No schedule data obtained from any source.")

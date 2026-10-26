@@ -112,6 +112,12 @@ def draw_slot(ax, x, y, w, h, state: str):
     elif state == "second":
         # Outage in second 30 mins
         ax.add_patch(Rectangle((x + w / 2, y), w / 2, h, linewidth=0, facecolor=COLOR_OUTAGE))
+    elif state == "mfirst":
+        # Possible outage in first 30 mins
+        ax.add_patch(Rectangle((x, y), w / 2, h, linewidth=0, facecolor=COLOR_MAYBE))
+    elif state == "msecond":
+        # Possible outage in second 30 mins
+        ax.add_patch(Rectangle((x + w / 2, y), w / 2, h, linewidth=0, facecolor=COLOR_MAYBE))
 
     # Border
     ax.add_patch(Rectangle((x, y), w, h, linewidth=1, edgecolor=COLOR_BORDER, facecolor="none"))
@@ -174,10 +180,14 @@ def render_single_queue(today_slots: dict, tomorrow_slots: dict | None, gkey: st
             state = tomorrow_slots.get(str(s_num), "yes")
             draw_slot(ax, x, y_pos, cell_w, cell_h, state)
 
-    ax.set_xlim(0, table_width)
-    ax.set_ylim(0, table_height)
-    ax.invert_yaxis()
+    pad_x = 0.04
+    pad_y = 0.04
+    ax.set_xlim(-pad_x, table_width + pad_x)
+    ax.set_ylim(table_height + pad_y, -pad_y)
     ax.axis("off")
+
+    # Clean outer border framing the table
+    ax.add_patch(Rectangle((0, 0), table_width, table_height, linewidth=1.5, edgecolor=COLOR_BORDER, facecolor="none"))
 
     # Header title
     fig.text(0.04, 0.96, "Графік відключень: Запоріжжя та область", fontsize=17, fontweight="bold")
@@ -190,36 +200,41 @@ def render_single_queue(today_slots: dict, tomorrow_slots: dict | None, gkey: st
 
     # Legend at bottom
     leg_y = 0.03
-    leg_x = 0.05
-    box_w = 0.02
-    box_h = 0.06
+    leg_x = 0.035
+    box_w = 0.018
+    box_h = 0.055
 
     # 1. Світло є
     fig.patches.append(Rectangle((leg_x, leg_y), box_w, box_h, linewidth=0.8, edgecolor=COLOR_BORDER, facecolor=COLOR_AVAILABLE, transform=fig.transFigure, clip_on=False))
-    fig.text(leg_x + box_w + 0.007, leg_y + box_h / 2, "Електроенергія є", fontsize=10.5, va="center")
+    fig.text(leg_x + box_w + 0.005, leg_y + box_h / 2, "Електроенергія є", fontsize=10, va="center")
 
     # 2. Світла немає
-    leg_x += 0.17
+    leg_x += 0.135
     fig.patches.append(Rectangle((leg_x, leg_y), box_w, box_h, linewidth=0.8, edgecolor=COLOR_BORDER, facecolor=COLOR_OUTAGE, transform=fig.transFigure, clip_on=False))
-    fig.text(leg_x + box_w + 0.007, leg_y + box_h / 2, "Відключення", fontsize=10.5, va="center")
+    fig.text(leg_x + box_w + 0.005, leg_y + box_h / 2, "Відключення", fontsize=10, va="center")
 
-    # 3. Перші 30 хв
-    leg_x += 0.15
+    # 3. Можливе відключення
+    leg_x += 0.12
+    fig.patches.append(Rectangle((leg_x, leg_y), box_w, box_h, linewidth=0.8, edgecolor=COLOR_BORDER, facecolor=COLOR_MAYBE, transform=fig.transFigure, clip_on=False))
+    fig.text(leg_x + box_w + 0.005, leg_y + box_h / 2, "Можливе відключення", fontsize=10, va="center")
+
+    # 4. Перші 30 хв
+    leg_x += 0.165
     fig.patches.append(Rectangle((leg_x, leg_y), box_w / 2, box_h, linewidth=0, facecolor=COLOR_OUTAGE, transform=fig.transFigure, clip_on=False))
     fig.patches.append(Rectangle((leg_x + box_w / 2, leg_y), box_w / 2, box_h, linewidth=0, facecolor=COLOR_AVAILABLE, transform=fig.transFigure, clip_on=False))
     fig.patches.append(Rectangle((leg_x, leg_y), box_w, box_h, linewidth=0.8, edgecolor=COLOR_BORDER, facecolor="none", transform=fig.transFigure, clip_on=False))
-    fig.text(leg_x + box_w + 0.007, leg_y + box_h / 2, "Відключення перші 30 хв.", fontsize=10.5, va="center")
+    fig.text(leg_x + box_w + 0.005, leg_y + box_h / 2, "Відключення перші 30 хв.", fontsize=10, va="center")
 
-    # 4. Другі 30 хв
-    leg_x += 0.22
+    # 5. Другі 30 хв
+    leg_x += 0.19
     fig.patches.append(Rectangle((leg_x, leg_y), box_w / 2, box_h, linewidth=0, facecolor=COLOR_AVAILABLE, transform=fig.transFigure, clip_on=False))
     fig.patches.append(Rectangle((leg_x + box_w / 2, leg_y), box_w / 2, box_h, linewidth=0, facecolor=COLOR_OUTAGE, transform=fig.transFigure, clip_on=False))
     fig.patches.append(Rectangle((leg_x, leg_y), box_w, box_h, linewidth=0.8, edgecolor=COLOR_BORDER, facecolor="none", transform=fig.transFigure, clip_on=False))
-    fig.text(leg_x + box_w + 0.007, leg_y + box_h / 2, "Відключення другі 30 хв.", fontsize=10.5, va="center")
+    fig.text(leg_x + box_w + 0.005, leg_y + box_h / 2, "Відключення другі 30 хв.", fontsize=10, va="center")
 
     # Update timestamp
     if last_updated:
-        fig.text(0.96, leg_y + box_h / 2, f"Опубліковано: {last_updated}", fontsize=10, ha="right", va="center", style="italic", color="#555555")
+        fig.text(0.965, leg_y + box_h / 2, f"Опубліковано: {last_updated}", fontsize=10, ha="right", va="center", style="italic", color="#555555")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, facecolor="#FFFFFF", dpi=130, bbox_inches="tight", pad_inches=0.15)
@@ -271,10 +286,14 @@ def render_all_queues_summary(day_data: dict, date_str: str, last_updated: str, 
 
         y_pos += cell_h
 
-    ax.set_xlim(0, table_width)
-    ax.set_ylim(0, table_height)
-    ax.invert_yaxis()
+    pad_x = 0.04
+    pad_y = 0.04
+    ax.set_xlim(-pad_x, table_width + pad_x)
+    ax.set_ylim(table_height + pad_y, -pad_y)
     ax.axis("off")
+
+    # Clean outer border framing the table
+    ax.add_patch(Rectangle((0, 0), table_width, table_height, linewidth=1.5, edgecolor=COLOR_BORDER, facecolor="none"))
 
     # Header title
     fig.text(0.04, 0.97, f"Графік відключень (всі черги): Запоріжжя та область", fontsize=17, fontweight="bold")
@@ -282,31 +301,35 @@ def render_all_queues_summary(day_data: dict, date_str: str, last_updated: str, 
 
     # Legend at bottom
     leg_y = 0.02
-    leg_x = 0.05
-    box_w = 0.02
+    leg_x = 0.035
+    box_w = 0.018
     box_h = 0.025
 
     fig.patches.append(Rectangle((leg_x, leg_y), box_w, box_h, linewidth=0.8, edgecolor=COLOR_BORDER, facecolor=COLOR_AVAILABLE, transform=fig.transFigure, clip_on=False))
-    fig.text(leg_x + box_w + 0.007, leg_y + box_h / 2, "Електроенергія є", fontsize=10.5, va="center")
+    fig.text(leg_x + box_w + 0.005, leg_y + box_h / 2, "Електроенергія є", fontsize=10, va="center")
 
-    leg_x += 0.17
+    leg_x += 0.135
     fig.patches.append(Rectangle((leg_x, leg_y), box_w, box_h, linewidth=0.8, edgecolor=COLOR_BORDER, facecolor=COLOR_OUTAGE, transform=fig.transFigure, clip_on=False))
-    fig.text(leg_x + box_w + 0.007, leg_y + box_h / 2, "Відключення", fontsize=10.5, va="center")
+    fig.text(leg_x + box_w + 0.005, leg_y + box_h / 2, "Відключення", fontsize=10, va="center")
 
-    leg_x += 0.15
+    leg_x += 0.12
+    fig.patches.append(Rectangle((leg_x, leg_y), box_w, box_h, linewidth=0.8, edgecolor=COLOR_BORDER, facecolor=COLOR_MAYBE, transform=fig.transFigure, clip_on=False))
+    fig.text(leg_x + box_w + 0.005, leg_y + box_h / 2, "Можливе відключення", fontsize=10, va="center")
+
+    leg_x += 0.165
     fig.patches.append(Rectangle((leg_x, leg_y), box_w / 2, box_h, linewidth=0, facecolor=COLOR_OUTAGE, transform=fig.transFigure, clip_on=False))
     fig.patches.append(Rectangle((leg_x + box_w / 2, leg_y), box_w / 2, box_h, linewidth=0, facecolor=COLOR_AVAILABLE, transform=fig.transFigure, clip_on=False))
     fig.patches.append(Rectangle((leg_x, leg_y), box_w, box_h, linewidth=0.8, edgecolor=COLOR_BORDER, facecolor="none", transform=fig.transFigure, clip_on=False))
-    fig.text(leg_x + box_w + 0.007, leg_y + box_h / 2, "Відключення перші 30 хв.", fontsize=10.5, va="center")
+    fig.text(leg_x + box_w + 0.005, leg_y + box_h / 2, "Відключення перші 30 хв.", fontsize=10, va="center")
 
-    leg_x += 0.22
+    leg_x += 0.19
     fig.patches.append(Rectangle((leg_x, leg_y), box_w / 2, box_h, linewidth=0, facecolor=COLOR_AVAILABLE, transform=fig.transFigure, clip_on=False))
     fig.patches.append(Rectangle((leg_x + box_w / 2, leg_y), box_w / 2, box_h, linewidth=0, facecolor=COLOR_OUTAGE, transform=fig.transFigure, clip_on=False))
     fig.patches.append(Rectangle((leg_x, leg_y), box_w, box_h, linewidth=0.8, edgecolor=COLOR_BORDER, facecolor="none", transform=fig.transFigure, clip_on=False))
-    fig.text(leg_x + box_w + 0.007, leg_y + box_h / 2, "Відключення другі 30 хв.", fontsize=10.5, va="center")
+    fig.text(leg_x + box_w + 0.005, leg_y + box_h / 2, "Відключення другі 30 хв.", fontsize=10, va="center")
 
     if last_updated:
-        fig.text(0.96, leg_y + box_h / 2, f"Опубліковано: {last_updated}", fontsize=10, ha="right", va="center", style="italic", color="#555555")
+        fig.text(0.965, leg_y + box_h / 2, f"Опубліковано: {last_updated}", fontsize=10, ha="right", va="center", style="italic", color="#555555")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, facecolor="#FFFFFF", dpi=130, bbox_inches="tight", pad_inches=0.15)
@@ -317,6 +340,7 @@ def main():
     parser = argparse.ArgumentParser(description="Render ZOE Outage Schedule PNGs")
     parser.add_argument("--json", required=True, help="Path to Zaporizhzhiaoblenergo.json")
     parser.add_argument("--out", default="images/Zaporizhzhiaoblenergo", help="Output directory")
+    parser.add_argument("--force", action="store_true", help="Force regenerate all images ignoring cache")
     args = parser.parse_args()
 
     json_path = Path(args.json)
@@ -340,10 +364,10 @@ def main():
         now_kyiv = datetime.now(TZ_KYIV).replace(hour=0, minute=0, second=0, microsecond=0)
         today_ts = str(int(now_kyiv.timestamp()))
 
-    tomorrow_ts = str(int(today_ts) + 86400)
-
     today_dt = datetime.fromtimestamp(int(today_ts), tz=TZ_KYIV)
-    tomorrow_dt = datetime.fromtimestamp(int(tomorrow_ts), tz=TZ_KYIV)
+    tomorrow_date = today_dt.date() + timedelta(days=1)
+    tomorrow_dt = datetime(tomorrow_date.year, tomorrow_date.month, tomorrow_date.day, 0, 0, tzinfo=TZ_KYIV)
+    tomorrow_ts = str(int(tomorrow_dt.timestamp()))
 
     today_str = f"{today_dt.day:02d} {MONTHS_UK[today_dt.month]}"
     tomorrow_str = f"{tomorrow_dt.day:02d} {MONTHS_UK[tomorrow_dt.month]}"
@@ -364,7 +388,7 @@ def main():
         fname = queue_filename(gkey)
         target_png = out_dir / fname
 
-        if check_cache(hash_dir, gkey, q_hash, today_code, target_png):
+        if args.force or check_cache(hash_dir, gkey, q_hash, today_code, target_png):
             render_single_queue(q_today, q_tomorrow, gkey, today_str, tomorrow_str if q_tomorrow else None, last_updated, target_png)
             save_cache(hash_dir, gkey, q_hash, today_code)
             # Also copy to root images dir if nested
@@ -380,7 +404,7 @@ def main():
     today_all_hash = calculate_hash({"data": today_data, "update": last_updated})
     today_all_png = out_dir / "gpv-all-today.png"
     stats["checked"] += 1
-    if check_cache(hash_dir, "gpv-all-today", today_all_hash, today_code, today_all_png):
+    if args.force or check_cache(hash_dir, "gpv-all-today", today_all_hash, today_code, today_all_png):
         render_all_queues_summary(today_data, today_str, last_updated, today_all_png)
         save_cache(hash_dir, "gpv-all-today", today_all_hash, today_code)
         if out_dir.name != "images" and out_dir.parent.name == "images":
@@ -396,7 +420,7 @@ def main():
         stats["checked"] += 1
         tom_all_hash = calculate_hash({"data": tomorrow_data, "update": last_updated})
         tom_all_png = out_dir / "gpv-all-tomorrow.png"
-        if check_cache(hash_dir, "gpv-all-tomorrow", tom_all_hash, today_code, tom_all_png):
+        if args.force or check_cache(hash_dir, "gpv-all-tomorrow", tom_all_hash, today_code, tom_all_png):
             render_all_queues_summary(tomorrow_data, tomorrow_str, last_updated, tom_all_png)
             save_cache(hash_dir, "gpv-all-tomorrow", tom_all_hash, today_code)
             if out_dir.name != "images" and out_dir.parent.name == "images":
