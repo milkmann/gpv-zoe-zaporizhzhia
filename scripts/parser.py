@@ -128,11 +128,11 @@ def fetch_html_with_retries(url: str, retries: int = 3, timeout: int = 20) -> st
 
 
 def parse_time_intervals(intervals_str: str) -> list[tuple[tuple[int, int], tuple[int, int]]]:
-    """Parse string like '10:30 – 13:30, 17:00 – 18:30' into list of ((start_h, start_m), (end_h, end_m))."""
+    """Parse string like '10:30 – 13:30, 17:00 – 18:30' or '10.00 - 14.00' into list of ((start_h, start_m), (end_h, end_m))."""
     res = []
     clean = html_lib.unescape(intervals_str)
     clean = clean.replace("—", "-").replace("–", "-").replace("−", "-").replace("\xa0", " ")
-    for m in re.finditer(r"(\d{1,2}):(\d{2})\s*(?:-|до)\s*(\d{1,2}):(\d{2})", clean, re.IGNORECASE):
+    for m in re.finditer(r"(\d{1,2})[:.](\d{2})\s*(?:-|до)\s*(\d{1,2})[:.](\d{2})", clean, re.IGNORECASE):
         sh, sm = int(m.group(1)), int(m.group(2))
         eh, em = int(m.group(3)), int(m.group(4))
         res.append(((sh, sm), (eh, em)))
@@ -167,7 +167,7 @@ def intervals_to_hours(intervals: list[tuple[tuple[int, int], tuple[int, int]]])
     return hours
 
 
-def parse_outages_from_html(html: str) -> tuple[dict, str | None]:
+def parse_outages_from_html(html: str, now_kyiv: datetime | None = None) -> tuple[dict, str | None]:
     """Parse articles from HTML and build fact schedule data and latest update timestamp."""
     articles = re.findall(
         r'<article[^>]*>.*?<h2>(.*?)</h2>.*?<div class="content">(.*?)</div>.*?</article>',
@@ -176,7 +176,8 @@ def parse_outages_from_html(html: str) -> tuple[dict, str | None]:
     )
     print(f"[INFO] Found {len(articles)} articles on page.")
 
-    now_kyiv = datetime.now(TZ_KYIV)
+    if now_kyiv is None:
+        now_kyiv = datetime.now(TZ_KYIV)
     year = now_kyiv.year
 
     days_data = {}
@@ -218,9 +219,12 @@ def parse_outages_from_html(html: str) -> tuple[dict, str | None]:
         queue_lines = []
         for line in clean_body.splitlines():
             line = line.replace("\xa0", " ").strip()
-            m = re.match(r"^(?:(?:черга|підчерга|група)\s*)?(\d\.\d)\s*:\s*(.+)$", line, re.IGNORECASE)
+            m = re.match(r"^(?:(?:черг[аи]|підчерг[аи]|груп[аи])\s*)?([0-9.,\sтаiі/]+)\s*:\s*(.+)$", line, re.IGNORECASE)
             if m:
-                queue_lines.append((m.group(1), m.group(2).strip()))
+                q_matches = re.findall(r"\b([1-6]\.[1-2])\b", m.group(1))
+                if q_matches:
+                    for q_num in q_matches:
+                        queue_lines.append((q_num, m.group(2).strip()))
 
         if queue_lines:
             upd_match = re.search(r"оновлено\s*(?:о\s*)?(\d{1,2}:\d{2})", clean_title + " " + clean_body, re.IGNORECASE)
@@ -321,6 +325,9 @@ def main():
         days_data, update_str = parse_outages_from_html(html)
     except Exception as e:
         print(f"[WARN] Failed to fetch {URL_ZOE_OUTAGE} directly: {e}")
+
+    # Fallback to secondary source if direct scraping failed or returned no schedule days
+    if not days_data:
         print("[INFO] Attempting fallback data source...")
         fallback = fetch_fallback_data()
         if fallback:
@@ -329,7 +336,7 @@ def main():
             fb_dt = parse_update_datetime(fb_update)
             ex_dt = parse_update_datetime(existing_upd_str)
 
-            if ex_dt and fb_dt and fb_dt <= ex_dt:
+            if ex_dt and (not fb_dt or fb_dt <= ex_dt):
                 print(f"[WARN] Fallback update ({fb_update}) is not newer than local file ({existing_upd_str}). Fallback rejected.")
             else:
                 days_data, update_str = fb_days, fb_update
@@ -349,10 +356,10 @@ def main():
         old_fact = existing_data.get("fact", {})
         new_fact = result.get("fact", {})
         if old_fact.get("data") == new_fact.get("data") and old_fact.get("today") == new_fact.get("today"):
-            # Same schedule data, only refresh update if needed to avoid stale timeout (>2 days)
+            # Same schedule data, only refresh update if needed to avoid stale timeout (>1 day)
             old_upd_dt = old_fact.get("update", "")
-            try:
-                parsed_old = datetime.strptime(old_upd_dt, "%d.%m.%Y %H:%M").replace(tzinfo=TZ_KYIV)
+            parsed_old = parse_update_datetime(old_upd_dt)
+            if parsed_old:
                 age_days = (datetime.now(TZ_KYIV) - parsed_old).days
                 if age_days < 1:
                     print("[INFO] Data unchanged and still fresh (<1 day old). Keeping existing timestamp.")
@@ -360,8 +367,6 @@ def main():
                     if "lastUpdated" in existing_data:
                         result["lastUpdated"] = existing_data["lastUpdated"]
                     has_changed = False
-            except Exception:
-                pass
 
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)

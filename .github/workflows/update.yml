@@ -48,6 +48,6 @@ jobs:
           else
             echo "Changes detected. Committing..."
             git commit -m "Update $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-            git pull --rebase origin main
+            git pull --rebase -X ours origin main || git pull --rebase origin main
             git push
           fi
