@@ -11,6 +11,7 @@ import ssl
 import sys
 import json
 import time
+import html as html_lib
 import urllib.request
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -50,6 +51,25 @@ DEFAULT_TIME_TYPE = {
 }
 
 URL_ZOE_OUTAGE = "https://www.zoe.com.ua/outage/"
+FALLBACK_URL = "https://raw.githubusercontent.com/yaroslav2901/OE_OUTAGE_DATA/main/data/Zaporizhzhiaoblenergo.json"
+
+
+def fetch_fallback_data() -> tuple[dict, str | None] | None:
+    """Fetch from backup source if official site is geo-blocked for cloud runners."""
+    try:
+        req = urllib.request.Request(FALLBACK_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode("utf-8"))
+                fact = data.get("fact", {})
+                days_data = fact.get("data", {})
+                update_str = fact.get("update")
+                if days_data:
+                    print(f"[OK] Successfully fetched fallback data from {FALLBACK_URL} ({len(days_data)} days, update: {update_str})")
+                    return days_data, update_str
+    except Exception as e:
+        print(f"[WARN] Fallback fetch failed: {e}")
+    return None
 
 
 def fetch_html_with_retries(url: str, retries: int = 3, timeout: int = 20) -> str:
@@ -88,7 +108,8 @@ def fetch_html_with_retries(url: str, retries: int = 3, timeout: int = 20) -> st
 def parse_time_intervals(intervals_str: str) -> list[tuple[tuple[int, int], tuple[int, int]]]:
     """Parse string like '10:30 – 13:30, 17:00 – 18:30' into list of ((start_h, start_m), (end_h, end_m))."""
     res = []
-    clean = intervals_str.replace("—", "-").replace("–", "-").replace("−", "-").replace("\xa0", " ")
+    clean = html_lib.unescape(intervals_str)
+    clean = clean.replace("—", "-").replace("–", "-").replace("−", "-").replace("\xa0", " ")
     for m in re.finditer(r"(\d{1,2}):(\d{2})\s*(?:-|до)\s*(\d{1,2}):(\d{2})", clean, re.IGNORECASE):
         sh, sm = int(m.group(1)), int(m.group(2))
         eh, em = int(m.group(3)), int(m.group(4))
@@ -140,11 +161,11 @@ def parse_outages_from_html(html: str) -> tuple[dict, str | None]:
     latest_update_str = None
 
     for h2, content in articles:
-        clean_title = re.sub(r"<[^>]+>", " ", h2).strip()
+        clean_title = html_lib.unescape(re.sub(r"<[^>]+>", " ", h2).strip())
 
         # Preserve newlines between block elements to avoid joining distinct lines
         content_newlines = re.sub(r"<\s*(?:br|/?p|/?div|/?li|/?tr)\b[^>]*>", "\n", content, flags=re.IGNORECASE)
-        clean_body = re.sub(r"<[^>]+>", " ", content_newlines)
+        clean_body = html_lib.unescape(re.sub(r"<[^>]+>", " ", content_newlines))
 
         # Find date
         date_match = re.search(r"(\d{1,2})\s+([а-яіїєА-ЯІЇЄ]+)", clean_title)
@@ -174,9 +195,9 @@ def parse_outages_from_html(html: str) -> tuple[dict, str | None]:
                 queue_lines.append((m.group(1), m.group(2).strip()))
 
         if queue_lines:
-            upd_match = re.search(r"оновлено\s*(\d{1,2}:\d{2})", clean_title, re.IGNORECASE)
+            upd_match = re.search(r"оновлено\s*(?:о\s*)?(\d{1,2}:\d{2})", clean_title + " " + clean_body, re.IGNORECASE)
             if not upd_match:
-                upd_match = re.search(r"(\d{1,2}:\d{2})", clean_body)
+                upd_match = re.search(r"(?:станом на|опубліковано|час[:\s]+)\s*(\d{1,2}:\d{2})", clean_body, re.IGNORECASE)
             upd_time = upd_match.group(1) if upd_match else now_kyiv.strftime("%H:%M")
             update_dt = f"{day_num:02d}.{month_num:02d}.{year} {upd_time}"
 
@@ -264,20 +285,23 @@ def main():
         except Exception as e:
             print(f"[WARN] Could not read existing {out_file}: {e}")
 
+    days_data = None
+    update_str = None
+
     try:
         html = fetch_html_with_retries(URL_ZOE_OUTAGE)
+        days_data, update_str = parse_outages_from_html(html)
     except Exception as e:
-        print(f"[ERROR] Failed to fetch {URL_ZOE_OUTAGE}: {e}")
-        if existing_data:
-            print("[INFO] Preserving existing data file due to network failure.")
-            sys.exit(0)
-        sys.exit(1)
+        print(f"[WARN] Failed to fetch {URL_ZOE_OUTAGE} directly: {e}")
+        print("[INFO] Attempting fallback data source...")
+        fallback = fetch_fallback_data()
+        if fallback:
+            days_data, update_str = fallback
 
-    days_data, update_str = parse_outages_from_html(html)
     if not days_data:
-        print("[WARN] No days parsed from HTML.")
+        print("[WARN] No schedule data obtained from any source.")
         if existing_data:
-            print("[INFO] Preserving existing data.")
+            print("[INFO] Preserving existing data file.")
             sys.exit(0)
         sys.exit(1)
 
