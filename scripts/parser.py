@@ -230,7 +230,7 @@ def parse_outages_from_html(html: str, now_kyiv: datetime | None = None) -> tupl
             upd_match = re.search(r"оновлено\s*(?:о\s*)?(\d{1,2}:\d{2})", clean_title + " " + clean_body, re.IGNORECASE)
             if not upd_match:
                 upd_match = re.search(r"(?:станом на|опубліковано|час[:\s]+)\s*(\d{1,2}:\d{2})", clean_body, re.IGNORECASE)
-            upd_time = upd_match.group(1) if upd_match else now_kyiv.strftime("%H:%M")
+            upd_time = upd_match.group(1) if upd_match else "00:00"
             update_dt = f"{day_num:02d}.{month_num:02d}.{article_year} {upd_time}"
 
             if latest_update_str is None:
@@ -261,7 +261,12 @@ def parse_outages_from_html(html: str, now_kyiv: datetime | None = None) -> tupl
                 days_data[day_ts] = day_queues
                 print(f"[OK] Parsed NO outages for population on {target_date.strftime('%Y-%m-%d')}")
                 if latest_update_str is None:
-                    latest_update_str = f"{day_num:02d}.{month_num:02d}.{article_year} {now_kyiv.strftime('%H:%M')}"
+                    upd_match = re.search(r"оновлено\s*(?:о\s*)?(\d{1,2}:\d{2})", clean_title + " " + clean_body, re.IGNORECASE)
+                    if not upd_match:
+                        upd_match = re.search(r"(?:станом на|опубліковано|час[:\s]+)\s*(\d{1,2}:\d{2})", clean_body, re.IGNORECASE)
+                    upd_time = upd_match.group(1) if upd_match else "00:00"
+                    latest_update_str = f"{day_num:02d}.{month_num:02d}.{article_year} {upd_time}"
+                latest_update_str = f"{day_num:02d}.{month_num:02d}.{article_year} {upd_time}"
 
     return days_data, latest_update_str
 
@@ -279,7 +284,7 @@ def build_output_json(days_data: dict, update_str: str | None) -> dict:
         days_data[today_key] = {q: {str(i): "yes" for i in range(1, 25)} for q in ALL_QUEUES}
 
     if not update_str:
-        update_str = now_kyiv.strftime("%d.%m.%Y %H:%M")
+        update_str = now_kyiv.strftime("%d.%m.%Y 00:00")
 
     # Keep only days within reasonable range (last 7 days and future days)
     min_ts = today_ts - 7 * 86400
@@ -356,17 +361,14 @@ def main():
         old_fact = existing_data.get("fact", {})
         new_fact = result.get("fact", {})
         if old_fact.get("data") == new_fact.get("data") and old_fact.get("today") == new_fact.get("today"):
-            # Same schedule data, only refresh update if needed to avoid stale timeout (>1 day)
+            # Schedule data and active day are 100% identical. Keep existing timestamps to ensure idempotency.
             old_upd_dt = old_fact.get("update", "")
-            parsed_old = parse_update_datetime(old_upd_dt)
-            if parsed_old:
-                age_days = (datetime.now(TZ_KYIV) - parsed_old).days
-                if age_days < 1:
-                    print("[INFO] Data unchanged and still fresh (<1 day old). Keeping existing timestamp.")
-                    result["fact"]["update"] = old_upd_dt
-                    if "lastUpdated" in existing_data:
-                        result["lastUpdated"] = existing_data["lastUpdated"]
-                    has_changed = False
+            if old_upd_dt:
+                result["fact"]["update"] = old_upd_dt
+            if "lastUpdated" in existing_data:
+                result["lastUpdated"] = existing_data["lastUpdated"]
+            has_changed = False
+            print("[INFO] Schedule data and day unchanged. Preserving existing update timestamp.")
 
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)

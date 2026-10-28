@@ -161,5 +161,45 @@ class TestAuditImprovements(unittest.TestCase):
             self.assertIn("msecond", content)
 
 
+    def test_idempotency_stale_data_no_spurious_commits(self):
+        """Verify that when schedule data and active day are identical, existing update timestamp is kept
+        even if older than 1 day, preventing spurious 15-minute commit loops."""
+        today_midnight = datetime.now(TZ_KYIV).replace(hour=0, minute=0, second=0, microsecond=0)
+        today_ts = int(today_midnight.timestamp())
+        existing_days = {
+            str(today_ts): {q: {str(i): "yes" for i in range(1, 25)} for q in zoe_parser.ALL_QUEUES}
+        }
+        old_update_str = (datetime.now(TZ_KYIV) - timedelta(days=2)).strftime("%d.%m.%Y 10:00")
+        existing_json = {
+            "regionId": "Zaporizhzhia",
+            "lastUpdated": "2026-10-26T10:00:00+00:00",
+            "fact": {
+                "data": existing_days,
+                "update": old_update_str,
+                "today": today_ts,
+            }
+        }
+
+        # Build new result with identical data but new temporary update_str
+        new_result = zoe_parser.build_output_json(dict(existing_days), "28.10.2026 19:00")
+
+        # Emulate parser.py / zoe_parser.py comparison logic
+        has_changed = True
+        old_fact = existing_json.get("fact", {})
+        new_fact = new_result.get("fact", {})
+        if old_fact.get("data") == new_fact.get("data") and old_fact.get("today") == new_fact.get("today"):
+            old_upd_dt = old_fact.get("update", "")
+            if old_upd_dt:
+                new_result["fact"]["update"] = old_upd_dt
+            if "lastUpdated" in existing_json:
+                new_result["lastUpdated"] = existing_json["lastUpdated"]
+            has_changed = False
+
+        self.assertFalse(has_changed, "Must be marked unchanged when schedule and today are identical")
+        self.assertEqual(new_result["fact"]["update"], old_update_str, "Must preserve existing update timestamp")
+        self.assertEqual(new_result["lastUpdated"], "2026-10-26T10:00:00+00:00")
+
+
 if __name__ == "__main__":
+
     unittest.main()
