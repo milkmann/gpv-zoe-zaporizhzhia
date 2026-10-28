@@ -266,8 +266,6 @@ def parse_outages_from_html(html: str, now_kyiv: datetime | None = None) -> tupl
                         upd_match = re.search(r"(?:станом на|опубліковано|час[:\s]+)\s*(\d{1,2}:\d{2})", clean_body, re.IGNORECASE)
                     upd_time = upd_match.group(1) if upd_match else "00:00"
                     latest_update_str = f"{day_num:02d}.{month_num:02d}.{article_year} {upd_time}"
-                latest_update_str = f"{day_num:02d}.{month_num:02d}.{article_year} {upd_time}"
-
     return days_data, latest_update_str
 
 
