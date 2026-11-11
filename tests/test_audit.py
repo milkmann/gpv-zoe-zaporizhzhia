@@ -199,6 +199,46 @@ class TestAuditImprovements(unittest.TestCase):
         self.assertEqual(new_result["fact"]["update"], old_update_str, "Must preserve existing update timestamp")
         self.assertEqual(new_result["lastUpdated"], "2026-10-26T10:00:00+00:00")
 
+    def test_visual_diff_computation(self):
+        """Verify compute_queue_diff correctly identifies 'more' and 'less' outages."""
+        # Hour 1: Light added (cancellation): "no" -> "yes" => ("less", "less")
+        # Hour 2: Outage added: "yes" -> "no" => ("more", "more")
+        # Hour 3: First half light added: "no" -> "second" => ("less", None)
+        # Hour 4: Second half light added: "no" -> "first" => (None, "less")
+        # Hour 5: Unchanged: "no" -> "no" => not in diff
+        curr = {
+            "1": "yes",
+            "2": "no",
+            "3": "second",
+            "4": "first",
+            "5": "no",
+        }
+        prev = {
+            "1": "no",
+            "2": "yes",
+            "3": "no",
+            "4": "no",
+            "5": "no",
+        }
+        diff = render_png.compute_queue_diff(curr, prev)
+        self.assertEqual(diff.get("1"), ("less", "less"))
+        self.assertEqual(diff.get("2"), ("more", "more"))
+        self.assertEqual(diff.get("3"), ("less", None))
+        self.assertEqual(diff.get("4"), (None, "less"))
+        self.assertNotIn("5", diff)
+
+    def test_draw_slot_with_diff_overlay(self):
+        """Verify draw_slot with visual diff renders without error."""
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots()
+        # Draw full cell diff
+        render_png.draw_slot(ax, 0, 0, 1.0, 0.5, "yes", diff=("less", "less"))
+        # Draw split cell diff
+        render_png.draw_slot(ax, 1, 0, 1.0, 0.5, "second", diff=("less", None))
+        render_png.draw_slot(ax, 2, 0, 1.0, 0.5, "first", diff=("more", None))
+        self.assertGreater(len(ax.patches), 6)
+        plt.close(fig)
+
 
 if __name__ == "__main__":
 

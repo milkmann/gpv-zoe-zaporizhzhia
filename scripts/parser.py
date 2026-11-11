@@ -368,6 +368,14 @@ def main():
             has_changed = False
             print("[INFO] Schedule data and day unchanged. Preserving existing update timestamp.")
 
+    if has_changed and existing_data:
+        prev_file = os.path.join(data_dir, "Zaporizhzhiaoblenergo_prev.json")
+        try:
+            with open(prev_file, "w", encoding="utf-8") as f:
+                json.dump(existing_data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
 
