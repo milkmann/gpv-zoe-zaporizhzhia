@@ -42,7 +42,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'pull_request' && '' || 'main' }}
+          ref: ${{ github.event_name == 'pull_request' && github.sha || 'main' }}
           fetch-depth: 30
 
       - name: Set up Python

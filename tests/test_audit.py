@@ -150,6 +150,7 @@ class TestParserAndRenderer(unittest.TestCase):
         self.assertFalse(zoe_parser.is_no_outages_notice("18 листопада ГОП скасовано", "Графіки обмеження потужності (ГОП) для промисловості скасовано."))
         self.assertFalse(zoe_parser.is_no_outages_notice("18 листопада", "Аварійних відключень не заплановано, діють ГПВ."))
         self.assertFalse(zoe_parser.is_no_outages_notice("18 листопада", "З 10:00 до 14:00 ГПВ скасовано."))
+        self.assertFalse(zoe_parser.is_no_outages_notice("18 листопада", "До 14:00 погодинні відключення відсутні."))
         self.assertFalse(zoe_parser.is_no_outages_notice("18 листопада", "Для черги 1.1 ГПВ скасовано."))
 
         # Must be TRUE (valid full-day GPV cancellation / no outages)
@@ -215,28 +216,99 @@ class TestParserAndRenderer(unittest.TestCase):
         self.assertFalse(zoe_parser.is_valid_days_data([]))
         self.assertFalse(zoe_parser.is_valid_days_data({"bad-key": _make_day_schedule()}))
         self.assertFalse(zoe_parser.is_valid_days_data({"1794952800": {"GPV1.1": {"1": "invalid"}}}))
+        self.assertFalse(zoe_parser.is_valid_days_data({"1794952800": {"GPV1.1": {"1": "yes"}}}))
 
-    def test_build_output_json_synthetic_control_and_merge_past_days(self):
-        """Verify allow_synthetic_today=False does not fabricate fresh update or synthetic day."""
+    def test_build_output_json_does_not_synthesize_today(self):
         now = datetime(2026, 11, 18, 10, 0, tzinfo=TZ_KYIV)
         today_ts = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
         yest_ts = str(today_ts - 86400)
 
-        # When allow_synthetic_today=True (live ZOE returned no new posts for >2d), refresh update
-        res_live = zoe_parser.build_output_json({}, "14.11.2026 10:00", now_kyiv=now, allow_synthetic_today=True)
-        self.assertEqual(res_live["fact"]["update"], "18.11.2026 10:00")
-        self.assertIn(str(today_ts), res_live["fact"]["data"])
+        result = zoe_parser.build_output_json({yest_ts: _make_day_schedule()}, "14.11.2026 10:00", now_kyiv=now)
+        self.assertEqual(result["fact"]["update"], "14.11.2026 10:00")
+        self.assertNotIn(str(today_ts), result["fact"]["data"])
 
-        # When allow_synthetic_today=False (sources failed), must NOT fabricate update or today
-        res_fail = zoe_parser.build_output_json({yest_ts: _make_day_schedule()}, "14.11.2026 10:00", now_kyiv=now, allow_synthetic_today=False)
-        self.assertEqual(res_fail["fact"]["update"], "14.11.2026 10:00")
-        self.assertNotIn(str(today_ts), res_fail["fact"]["data"])
-
-        # merge_past_days preserves yesterday when fallback only has today
         existing = {"fact": {"data": {yest_ts: _make_day_schedule({"GPV1.1": {"1": "no"}})}}}
         merged = zoe_parser.merge_past_days({str(today_ts): _make_day_schedule()}, existing, today_ts)
         self.assertIn(yest_ts, merged)
         self.assertIn(str(today_ts), merged)
+
+    def test_no_gpv_notices_on_explicit_dates_only(self):
+        now = datetime(2026, 7, 14, 10, tzinfo=TZ_KYIV)
+        metadata = {}
+        html = """
+        <article>
+          <h2>ГРАФІКИ ПОГОДИННИХ ВІДКЛЮЧЕНЬ НА 15 ЛИПНЯ НЕ ЗАПЛАНОВАНІ</h2>
+          <div class="content">15 липня введення ГПВ та ГОП по Запорізькій області не заплановано</div>
+        </article>
+        <article>
+          <h2>ГПВ не заплановано з 16 по 18 липня</h2>
+          <div class="content">Наступне повідомлення очікується 19 липня.</div>
+        </article>
+        """
+        days, _ = zoe_parser.parse_outages_from_html(html, now, metadata)
+        expected = {str(int(datetime(2026, 7, day, tzinfo=TZ_KYIV).timestamp())) for day in (15, 16, 17, 18)}
+        self.assertEqual(set(days), expected)
+        self.assertEqual(metadata["availability"], dict.fromkeys(expected, "no_gpv"))
+        self.assertTrue(all(day == _make_day_schedule() for day in days.values()))
+
+    def test_parser_keeps_confirmed_days_and_classifies_missing_days(self):
+        now = datetime(2026, 11, 18, 12, tzinfo=TZ_KYIV)
+        midnight = now.replace(hour=0)
+        today, tomorrow = (str(int((midnight + timedelta(days=n)).timestamp())) for n in (0, 1))
+        saved_day = _make_day_schedule({"GPV1.1": {"11": "no"}})
+        cached = zoe_parser.build_output_json({today: saved_day, tomorrow: saved_day}, "18.11.2026 09:00", now)
+        cached["schedule_updates"] = {today: "18.11.2026 09:00", tomorrow: "18.11.2026 09:00"}
+        tomorrow_html = '<article><h2>ГПВ на 19 листопада (оновлено о 11:00)</h2><div class="content">1.1: 12:00–14:00</div></article>'
+        unrelated = '<article><h2>Новини на 18 листопада</h2><div class="content">Технічні роботи скасовано.</div></article>'
+        malformed = '<article><h2>ГПВ на 18 листопада</h2><div class="content"><p>1.1: з 10 до 12</p><p>1.2: з 12 до 14</p></div></article>'
+        stale = '<article><h2>ГПВ на 18 листопада (оновлено о 08:00)</h2><div class="content">1.1: 12:00–14:00</div></article>'
+        no_gpv = '<article><h2>ГПВ на 18 листопада не заплановані</h2><div class="content">Введення ГПВ не заплановано.</div></article>'
+        legacy_all_yes = zoe_parser.build_output_json({today: _make_day_schedule()}, "18.11.2026 09:00", now)
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now.astimezone(tz)
+
+        cases = (
+            ("tomorrow only", tomorrow_html, None, None, "unpublished", False),
+            ("tomorrow and fallback today", tomorrow_html, ({today: saved_day}, "18.11.2026 10:00"), None, None, True),
+            ("unrelated notice", unrelated, None, None, "unpublished", False),
+            ("legacy all-yes and fallback all-yes without notice", unrelated, ({today: _make_day_schedule()}, "18.11.2026 10:00"), legacy_all_yes, "unpublished", False),
+            ("malformed schedule", malformed, None, None, "update_failed", False),
+            ("malformed newest, older post follows", malformed + stale, None, None, "update_failed", False),
+            ("source failure", TimeoutError(), None, None, "update_failed", False),
+            ("cached during failure", TimeoutError(), None, cached, "cached", True),
+            ("older official update", stale, None, cached, "cached", True),
+            ("explicit no GPV", no_gpv, None, None, "no_gpv", True),
+            ("same slots newer timestamp", TimeoutError(), ({today: saved_day}, "18.11.2026 10:00"), cached, None, True),
+        )
+        for name, source, fallback, existing, expected_status, has_today in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "data" / "Zaporizhzhiaoblenergo.json"
+                if existing:
+                    path.parent.mkdir()
+                    path.write_text(json.dumps(existing), encoding="utf-8")
+                fetch_args = {"side_effect": source} if isinstance(source, Exception) else {"return_value": source}
+                with (
+                    patch.object(zoe_parser, "__file__", str(Path(tmp) / "scripts" / "parser.py")),
+                    patch.object(zoe_parser, "datetime", FixedDateTime),
+                    patch.object(zoe_parser, "fetch_html_with_retries", **fetch_args),
+                    patch.object(zoe_parser, "fetch_fallback_data", return_value=fallback),
+                ):
+                    zoe_parser.main()
+                result = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(result["availability"].get(today), expected_status)
+                self.assertEqual(today in result["fact"]["data"], has_today)
+                if has_today:
+                    expected_day = _make_day_schedule() if expected_status == "no_gpv" else saved_day
+                    self.assertEqual(result["fact"]["data"][today], expected_day)
+                if source == tomorrow_html or existing is cached:
+                    self.assertIn(tomorrow, result["fact"]["data"])
+                if expected_status == "no_gpv":
+                    self.assertEqual(result["fact"]["update"], "18.11.2026 00:00")
+                if name == "same slots newer timestamp":
+                    self.assertEqual(result["fact"]["update"], "18.11.2026 10:00")
 
     def test_fetch_html_with_retries_non_200(self):
         """Verify non-200 response sets error and exhausts retries cleanly."""
@@ -308,9 +380,45 @@ class TestParserAndRenderer(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "gpv-all-tomorrow.png"
-            render_png.render_tomorrow_unavailable("19 листопада", "18.11.2026 05:57", out)
+            render_png.render_schedule_unavailable("19 листопада", "18.11.2026 05:57", out, "unpublished")
             self.assertTrue(out.exists())
             self.assertGreater(out.stat().st_size, 5000)
+
+    def test_renderer_uses_kyiv_date_and_never_renders_missing_slots(self):
+        now = datetime(2026, 11, 18, tzinfo=TZ_KYIV)
+        today = str(int(now.timestamp()))
+        tomorrow = str(int((now + timedelta(days=1)).timestamp()))
+        yesterday = str(int((now - timedelta(days=1)).timestamp()))
+        day = _make_day_schedule({"GPV1.1": {"11": "no"}})
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now.astimezone(tz)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "schedule.json"
+            path.write_text(json.dumps({
+                "fact": {"data": {yesterday: day, today: {"GPV1.1": {"1": "yes"}}, tomorrow: day}, "today": int(yesterday)},
+                "availability": {today: "update_failed", tomorrow: "cached"},
+            }), encoding="utf-8")
+            with (
+                patch.object(sys, "argv", ["render_png.py", "--json", str(path), "--out", tmp, "--force"]),
+                patch.object(render_png, "datetime", FixedDateTime),
+                patch.object(render_png, "load_previous_jsons", return_value=[]),
+                patch.object(render_png, "render_single_queue") as queue,
+                patch.object(render_png, "render_schedule_unavailable") as unavailable,
+                patch.object(render_png, "render_all_queues_summary") as summary,
+            ):
+                render_png.main()
+            self.assertEqual(queue.call_count, 12)
+            self.assertIsNone(queue.call_args_list[0].args[0])
+            self.assertEqual(queue.call_args_list[0].args[1], day["GPV1.1"])
+            self.assertEqual(queue.call_args_list[0].kwargs["today_status"], "update_failed")
+            self.assertEqual(unavailable.call_args.args[0], "18 листопада")
+            self.assertEqual(unavailable.call_args.args[3], "update_failed")
+            self.assertEqual(summary.call_args.args[:2], (day, "19 листопада"))
+            self.assertEqual(summary.call_args.kwargs["status"], "cached")
 
     def test_ha_parser_parity(self):
         """Optional parity check when HA_ZOE_PARSER_PATH env var points to Home Assistant script."""
