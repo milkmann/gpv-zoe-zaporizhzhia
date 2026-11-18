@@ -58,6 +58,26 @@ MONTHS_UK = {
     9: "вересня", 10: "жовтня", 11: "листопада", 12: "грудня",
 }
 
+AVAILABILITY_LABELS = {
+    "unpublished": "Графік поки не опубліковано",
+    "update_failed": "Не вдалося оновити графік",
+    "no_gpv": "ГПВ не заплановано",
+    "cached": "Збережений графік",
+}
+HOUR_KEYS = {str(hour) for hour in SLOTS}
+VALID_SLOT_STATES = {"yes", "no", "maybe", "first", "second", "mfirst", "msecond"}
+
+
+def get_complete_day(fact_data: dict, day_ts: str) -> dict:
+    day = fact_data.get(day_ts)
+    if isinstance(day, dict) and all(
+        isinstance(day.get(queue), dict) and day[queue].keys() == HOUR_KEYS
+        and all(isinstance(state, str) and state in VALID_SLOT_STATES for state in day[queue].values())
+        for queue in ALL_QUEUES
+    ):
+        return day
+    return {}
+
 
 def queue_filename(gpv_key: str) -> str:
     """Convert GPV1.1 to gpv-1-1-emergency.png"""
@@ -368,9 +388,10 @@ def draw_legend(fig, leg_y: float, box_h: float, last_updated: str):
 
 
 def render_single_queue(
-    today_slots: dict, tomorrow_slots: dict | None, gkey: str,
+    today_slots: dict | None, tomorrow_slots: dict | None, gkey: str,
     today_str: str, tomorrow_str: str | None, last_updated: str,
     output_path: Path, today_diff: dict | None = None, tomorrow_diff: dict | None = None,
+    today_status: str = "", tomorrow_status: str = "",
 ):
     """Render 2-day schedule for a single queue with Visual Diff and total outage hours."""
     fig, ax = plt.subplots(figsize=(20.5, 3.6), dpi=130)
@@ -383,7 +404,7 @@ def render_single_queue(
     total_w = 1.35
     header_h = 0.95
 
-    has_tomorrow = bool(tomorrow_slots)
+    has_tomorrow = tomorrow_str is not None
     rows_count = 2 if has_tomorrow else 1
 
     table_width = label_w + 24 * cell_w + total_w
@@ -406,36 +427,30 @@ def render_single_queue(
 
     y_pos += header_h
 
-    # Row 1: Today
-    ax.add_patch(Rectangle((0, y_pos), label_w, cell_h, linewidth=1, edgecolor=COLOR_BORDER, facecolor=COLOR_LABEL))
-    ax.text(label_w / 2, y_pos + cell_h / 2, today_str, fontsize=11.5, ha="center", va="center", fontweight="bold")
-
-    for i, s_num in enumerate(SLOTS):
-        x = label_w + i * cell_w
-        state = today_slots.get(str(s_num), "yes")
-        diff = today_diff.get(str(s_num)) if today_diff else None
-        draw_slot(ax, x, y_pos, cell_w, cell_h, state, diff=diff)
-
-    today_hrs = format_hours(calc_outage_hours(today_slots))
-    ax.add_patch(Rectangle((x_tot, y_pos), total_w, cell_h, linewidth=1, edgecolor=COLOR_BORDER, facecolor=COLOR_LABEL))
-    ax.text(x_tot + total_w / 2, y_pos + cell_h / 2, f"{today_hrs} г", fontsize=10.5, ha="center", va="center", fontweight="bold")
-
-    y_pos += cell_h
-
-    # Row 2: Tomorrow (if available)
+    rows = [(today_str, today_slots, today_diff, today_status)]
     if has_tomorrow:
+        rows.append((tomorrow_str, tomorrow_slots, tomorrow_diff, tomorrow_status))
+    for date_label, slots, diff, status in rows:
         ax.add_patch(Rectangle((0, y_pos), label_w, cell_h, linewidth=1, edgecolor=COLOR_BORDER, facecolor=COLOR_LABEL))
-        ax.text(label_w / 2, y_pos + cell_h / 2, tomorrow_str, fontsize=11.5, ha="center", va="center", fontweight="bold")
+        if slots and status in ("no_gpv", "cached"):
+            short_label = "Без ГПВ" if status == "no_gpv" else "Збережено"
+            date_label = f"{date_label}\n{short_label}"
+        ax.text(label_w / 2, y_pos + cell_h / 2, date_label, fontsize=10, ha="center", va="center", fontweight="bold")
 
-        for i, s_num in enumerate(SLOTS):
-            x = label_w + i * cell_w
-            state = tomorrow_slots.get(str(s_num), "yes")
-            diff = tomorrow_diff.get(str(s_num)) if tomorrow_diff else None
-            draw_slot(ax, x, y_pos, cell_w, cell_h, state, diff=diff)
+        total = "—"
+        if slots:
+            for i, s_num in enumerate(SLOTS):
+                x = label_w + i * cell_w
+                draw_slot(ax, x, y_pos, cell_w, cell_h, slots[str(s_num)], diff=(diff or {}).get(str(s_num)))
+            total = f"{format_hours(calc_outage_hours(slots))} г"
+        else:
+            ax.add_patch(Rectangle((label_w, y_pos), x_tot - label_w, cell_h, linewidth=1, edgecolor=COLOR_BORDER, facecolor="#F7F9FC"))
+            label = AVAILABILITY_LABELS.get(status, AVAILABILITY_LABELS["unpublished"])
+            ax.text((label_w + x_tot) / 2, y_pos + cell_h / 2, label, fontsize=11, ha="center", va="center")
 
-        tom_hrs = format_hours(calc_outage_hours(tomorrow_slots))
         ax.add_patch(Rectangle((x_tot, y_pos), total_w, cell_h, linewidth=1, edgecolor=COLOR_BORDER, facecolor=COLOR_LABEL))
-        ax.text(x_tot + total_w / 2, y_pos + cell_h / 2, f"{tom_hrs} г", fontsize=10.5, ha="center", va="center", fontweight="bold")
+        ax.text(x_tot + total_w / 2, y_pos + cell_h / 2, total, fontsize=10.5, ha="center", va="center", fontweight="bold")
+        y_pos += cell_h
 
     pad_x = 0.04
     pad_y = 0.04
@@ -459,7 +474,7 @@ def render_single_queue(
     plt.close(fig)
 
 
-def render_all_queues_summary(day_data: dict, date_str: str, last_updated: str, output_path: Path, day_diff: dict | None = None):
+def render_all_queues_summary(day_data: dict, date_str: str, last_updated: str, output_path: Path, day_diff: dict | None = None, status: str = ""):
     """Render overview chart of all 12 queues on a single day with Visual Diff and outage hours."""
     fig, ax = plt.subplots(figsize=(20.5, 8.5), dpi=130)
     fig.patch.set_facecolor("#FFFFFF")
@@ -522,6 +537,8 @@ def render_all_queues_summary(day_data: dict, date_str: str, last_updated: str, 
 
     fig.text(0.04, 0.97, "Графік відключень (всі черги): Запоріжжя та область", fontsize=17, fontweight="bold")
     fig.text(0.96, 0.97, f"Дата: {date_str}", fontsize=16, fontweight="bold", ha="right")
+    if status in ("no_gpv", "cached"):
+        fig.text(0.04, 0.935, AVAILABILITY_LABELS[status], fontsize=12, color="#555555")
 
     draw_legend(fig, leg_y=0.02, box_h=0.025, last_updated=last_updated)
 
@@ -530,8 +547,8 @@ def render_all_queues_summary(day_data: dict, date_str: str, last_updated: str, 
     plt.close(fig)
 
 
-def render_tomorrow_unavailable(tomorrow_str: str, last_updated: str, output_path: Path):
-    """Render clean placeholder image when tomorrow's schedule is not yet published."""
+def render_schedule_unavailable(date_str: str, last_updated: str, output_path: Path, status: str):
+    """Render a placeholder when a calendar day has no complete schedule."""
     fig, ax = plt.subplots(figsize=(14, 3.2), dpi=130)
     fig.patch.set_facecolor("#FFFFFF")
     ax.set_facecolor("#F7F9FC")
@@ -541,8 +558,8 @@ def render_tomorrow_unavailable(tomorrow_str: str, last_updated: str, output_pat
     ax.axis("off")
     ax.add_patch(Rectangle((0.1, 0.25), 9.8, 2.5, linewidth=1.5, edgecolor=COLOR_BORDER, facecolor="#F7F9FC"))
 
-    ax.text(5.0, 1.85, f"Графік відключень на {tomorrow_str} ще не опубліковано", fontsize=17, fontweight="bold", ha="center", va="center", color="#222222")
-    ax.text(5.0, 1.1, "Дані оновляться автоматично одразу після публікації АТ «Запоріжжяобленерго»", fontsize=12, ha="center", va="center", color="#555555")
+    ax.text(5.0, 1.85, AVAILABILITY_LABELS[status], fontsize=17, fontweight="bold", ha="center", va="center", color="#222222")
+    ax.text(5.0, 1.1, f"Дата: {date_str}", fontsize=12, ha="center", va="center", color="#555555")
     if last_updated:
         ax.text(9.75, 0.45, f"Останнє оновлення: {last_updated}", fontsize=10, ha="right", va="center", style="italic", color="#666666")
 
@@ -573,29 +590,24 @@ def main():
     fact = data.get("fact", {})
     fact_data = fact.get("data", {})
     last_updated = fact.get("update", "")
-    today_ts = str(fact.get("today", ""))
-
-    now_kyiv_midnight = datetime.now(TZ_KYIV).replace(hour=0, minute=0, second=0, microsecond=0)
-    actual_today_ts = str(int(now_kyiv_midnight.timestamp()))
-
-    if not today_ts or today_ts not in fact_data:
-        today_ts = actual_today_ts
-    elif int(today_ts) < int(actual_today_ts) and actual_today_ts in fact_data:
-        today_ts = actual_today_ts
-
-    today_dt = datetime.fromtimestamp(int(today_ts), tz=TZ_KYIV)
-    tomorrow_date = today_dt.date() + timedelta(days=1)
-    tomorrow_dt = datetime(tomorrow_date.year, tomorrow_date.month, tomorrow_date.day, 0, 0, tzinfo=TZ_KYIV)
+    availability = data.get("availability", {})
+    today_dt = datetime.now(TZ_KYIV).replace(hour=0, minute=0, second=0, microsecond=0)
+    tomorrow_dt = today_dt + timedelta(days=1)
+    today_ts = str(int(today_dt.timestamp()))
     tomorrow_ts = str(int(tomorrow_dt.timestamp()))
 
     today_str = f"{today_dt.day:02d} {MONTHS_UK[today_dt.month]}"
     tomorrow_str = f"{tomorrow_dt.day:02d} {MONTHS_UK[tomorrow_dt.month]}"
     today_code = today_dt.strftime("%Y-%m-%d")
 
-    today_data = fact_data.get(today_ts, {})
-    if not today_data:
-        print(f"[WARN] No schedule entry for {today_str} (ts={today_ts}) in {json_path}; rendering default 'all yes'.")
-    tomorrow_data = fact_data.get(tomorrow_ts)
+    today_data = get_complete_day(fact_data, today_ts)
+    tomorrow_data = get_complete_day(fact_data, tomorrow_ts)
+    today_status = availability.get(today_ts, "") if today_data else (
+        "update_failed" if today_ts in fact_data or availability.get(today_ts) == "update_failed" else "unpublished"
+    )
+    tomorrow_status = availability.get(tomorrow_ts, "") if tomorrow_data else (
+        "update_failed" if tomorrow_ts in fact_data or availability.get(tomorrow_ts) == "update_failed" else "unpublished"
+    )
 
     # Load previous schedule revisions for per-day Visual Diff
     prev_jsons = load_previous_jsons(json_path, args.prev_json)
@@ -621,8 +633,8 @@ def main():
     # 1. Render individual queue cards
     for gkey in ALL_QUEUES:
         stats["checked"] += 1
-        q_today = today_data.get(gkey, {str(s): "yes" for s in SLOTS})
-        q_tomorrow = tomorrow_data.get(gkey) if tomorrow_data else None
+        q_today = today_data.get(gkey)
+        q_tomorrow = tomorrow_data.get(gkey)
         q_tdiff = today_diff.get(gkey, {})
         q_tomdiff = tomorrow_diff.get(gkey, {})
 
@@ -632,6 +644,8 @@ def main():
             "update": last_updated,
             "diff_today": q_tdiff,
             "diff_tom": q_tomdiff,
+            "today_status": today_status,
+            "tomorrow_status": tomorrow_status,
         })
         fname = queue_filename(gkey)
         target_png = out_dir / fname
@@ -639,9 +653,10 @@ def main():
         if args.force or check_cache(hash_dir, gkey, q_hash, today_code, target_png):
             render_single_queue(
                 q_today, q_tomorrow, gkey,
-                today_str, tomorrow_str if q_tomorrow else None,
+                today_str, tomorrow_str,
                 last_updated, target_png,
                 today_diff=q_tdiff, tomorrow_diff=q_tomdiff,
+                today_status=today_status, tomorrow_status=tomorrow_status,
             )
             save_cache(hash_dir, gkey, q_hash, today_code)
             stats["generated"] += 1
@@ -649,49 +664,22 @@ def main():
         else:
             stats["skipped"] += 1
 
-    # 2. Render all-queues overview for today
-    today_all_hash = calculate_hash({
-        "data": today_data,
-        "update": last_updated,
-        "diff": today_diff,
-    })
-    today_all_png = out_dir / "gpv-all-today.png"
-    stats["checked"] += 1
-    if args.force or check_cache(hash_dir, "gpv-all-today", today_all_hash, today_code, today_all_png):
-        render_all_queues_summary(today_data, today_str, last_updated, today_all_png, day_diff=today_diff)
-        save_cache(hash_dir, "gpv-all-today", today_all_hash, today_code)
-        stats["generated"] += 1
-        print("[RENDERED] gpv-all-today.png")
-    else:
-        stats["skipped"] += 1
-
-    # 3. Render all-queues overview for tomorrow (or placeholder when unavailable)
-    stats["checked"] += 1
-    tom_all_png = out_dir / "gpv-all-tomorrow.png"
-    if tomorrow_data:
-        tom_all_hash = calculate_hash({
-            "data": tomorrow_data,
-            "update": last_updated,
-            "diff": tomorrow_diff,
-        })
-        if args.force or check_cache(hash_dir, "gpv-all-tomorrow", tom_all_hash, today_code, tom_all_png):
-            render_all_queues_summary(tomorrow_data, tomorrow_str, last_updated, tom_all_png, day_diff=tomorrow_diff)
-            save_cache(hash_dir, "gpv-all-tomorrow", tom_all_hash, today_code)
+    # 2. Render each all-queues overview or its placeholder
+    for name, date_str, day_data, day_diff, status in (
+        ("gpv-all-today", today_str, today_data, today_diff, today_status),
+        ("gpv-all-tomorrow", tomorrow_str, tomorrow_data, tomorrow_diff, tomorrow_status),
+    ):
+        stats["checked"] += 1
+        target_png = out_dir / f"{name}.png"
+        day_hash = calculate_hash({"data": day_data, "update": last_updated, "diff": day_diff, "status": status})
+        if args.force or check_cache(hash_dir, name, day_hash, today_code, target_png):
+            if day_data:
+                render_all_queues_summary(day_data, date_str, last_updated, target_png, day_diff=day_diff, status=status)
+            else:
+                render_schedule_unavailable(date_str, last_updated, target_png, status)
+            save_cache(hash_dir, name, day_hash, today_code)
             stats["generated"] += 1
-            print("[RENDERED] gpv-all-tomorrow.png")
-        else:
-            stats["skipped"] += 1
-    else:
-        tom_placeholder_hash = calculate_hash({
-            "unavailable": True,
-            "tomorrow": tomorrow_str,
-            "update": last_updated,
-        })
-        if args.force or check_cache(hash_dir, "gpv-all-tomorrow", tom_placeholder_hash, today_code, tom_all_png):
-            render_tomorrow_unavailable(tomorrow_str, last_updated, tom_all_png)
-            save_cache(hash_dir, "gpv-all-tomorrow", tom_placeholder_hash, today_code)
-            stats["generated"] += 1
-            print("[RENDERED] gpv-all-tomorrow.png (placeholder)")
+            print(f"[RENDERED] {target_png.name}")
         else:
             stats["skipped"] += 1
 
