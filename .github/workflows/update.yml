@@ -19,6 +19,14 @@ on:
       - 'tests/**'
       - 'requirements.txt'
       - '.github/workflows/update.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'scripts/**'
+      - 'tests/**'
+      - 'requirements.txt'
+      - '.github/workflows/update.yml'
 
 concurrency:
   group: update-outage-data
@@ -34,7 +42,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.event_name == 'pull_request' && '' || 'main' }}
           fetch-depth: 30
 
       - name: Set up Python
@@ -48,17 +56,19 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run unit tests
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
         run: python -m unittest discover -s tests -v
 
       - name: Run parser
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_parser) }}
+        if: ${{ github.event_name != 'pull_request' && !(github.event_name == 'workflow_dispatch' && inputs.skip_parser) }}
         run: python scripts/parser.py
 
       - name: Render schedule images
+        if: github.event_name != 'pull_request'
         run: python scripts/render_png.py --json data/Zaporizhzhiaoblenergo.json --out images/Zaporizhzhiaoblenergo
 
       - name: Commit and push if changed
+        if: github.event_name != 'pull_request'
         run: |
           git config --local user.name "github-actions[bot]"
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
@@ -68,6 +78,16 @@ jobs:
           else
             echo "Changes detected. Committing..."
             git commit -m "Update $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-            git pull --rebase origin main
+            if ! git pull --rebase origin main; then
+              echo "Rebase conflict detected (likely concurrent HA push); rebasing PNGs on latest remote JSON..."
+              git rebase --abort || true
+              git fetch origin main
+              git reset --hard origin/main
+              python scripts/render_png.py --json data/Zaporizhzhiaoblenergo.json --out images/Zaporizhzhiaoblenergo
+              git add -A data/ images/
+              if ! git diff --staged --quiet; then
+                git commit -m "Update $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+              fi
+            fi
             git push
           fi

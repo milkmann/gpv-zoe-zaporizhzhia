@@ -88,6 +88,18 @@ def format_hours(hours: float) -> str:
     return f"{int(hours)}" if hours.is_integer() else f"{hours:.1f}"
 
 
+def is_all_yes_day(day_data: dict | None) -> bool:
+    """Return True if all 12 queues have zero outages (e.g. midnight synthetic default)."""
+    if not isinstance(day_data, dict) or not day_data:
+        return True
+    for q in ALL_QUEUES:
+        slots = day_data.get(q, {})
+        for s in SLOTS:
+            if slots.get(str(s), "yes") != "yes":
+                return False
+    return True
+
+
 def calculate_hash(data: dict) -> str:
     data_str = json.dumps(data, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(data_str.encode("utf-8")).hexdigest()
@@ -142,7 +154,6 @@ def compute_queue_diff(curr_slots: dict, prev_slots: dict | None) -> dict[str, t
     Compare curr_slots against prev_slots for 24 hours.
     Returns dict mapping hour_str ('1'..'24') -> (half1_diff, half2_diff),
     where diff is 'more', 'less', or None.
-    Only hours with at least one non-None half are included.
     """
     if not prev_slots:
         return {}
@@ -174,8 +185,10 @@ def compute_queue_diff(curr_slots: dict, prev_slots: dict | None) -> dict[str, t
 
 
 def compute_schedule_diff(curr_day_data: dict, prev_day_data: dict | None) -> dict[str, dict]:
-    """Compute diff for all 12 queues in a day."""
+    """Compute diff for all 12 queues in a day, suppressing synthetic all-yes baseline storms."""
     if not prev_day_data:
+        return {}
+    if is_all_yes_day(prev_day_data) and not is_all_yes_day(curr_day_data):
         return {}
     res = {}
     for q in ALL_QUEUES:
@@ -187,12 +200,12 @@ def compute_schedule_diff(curr_day_data: dict, prev_day_data: dict | None) -> di
     return res
 
 
-def load_previous_json(current_json_path: Path, prev_arg: str | None = None) -> dict | None:
+def load_previous_jsons(current_json_path: Path, prev_arg: str | None = None, max_commits: int = 15) -> list[dict]:
     """
-    Load previous schedule JSON for diff comparison.
+    Load recent previous schedule JSON revisions (newest first) for per-day Visual Diff.
     Priority:
     1. Explicit --prev-json argument if supplied
-    2. Git history for the previous revision of the json file (handles both GHA and HA pushes)
+    2. Git history commits touching the JSON file (handles both GHA working-tree updates and HA API pushes)
     3. Sidecar file <stem>_prev.json when running outside a git repository
     """
     if prev_arg:
@@ -200,11 +213,11 @@ def load_previous_json(current_json_path: Path, prev_arg: str | None = None) -> 
         if p.exists():
             try:
                 with open(p, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    return [json.load(f)]
             except Exception as e:
                 print(f"[WARN] Failed to read --prev-json: {e}")
 
-    # Check git history first so HA API commits are always diffed accurately
+    history: list[dict] = []
     try:
         resolved = current_json_path.resolve()
         top_res = subprocess.run(
@@ -212,48 +225,79 @@ def load_previous_json(current_json_path: Path, prev_arg: str | None = None) -> 
             cwd=resolved.parent,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         if top_res.returncode == 0 and top_res.stdout.strip():
             repo_dir = Path(top_res.stdout.strip()).resolve()
             rel_path = resolved.relative_to(repo_dir).as_posix()
             log_res = subprocess.run(
-                ["git", "log", "-n", "3", "--format=%H", "--", rel_path],
+                ["git", "log", "-n", str(max_commits), "--format=%H", "--", rel_path],
                 cwd=repo_dir,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
             if log_res.returncode == 0:
                 commits = [line.strip() for line in log_res.stdout.splitlines() if line.strip()]
                 diff_res = subprocess.run(
-                    ["git", "diff", "--name-only", "--", rel_path],
+                    ["git", "diff", "HEAD", "--name-only", "--", rel_path],
                     cwd=repo_dir,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                 )
                 is_wt_mod = bool(diff_res.stdout.strip())
-                target_commit = commits[0] if is_wt_mod else (commits[1] if len(commits) > 1 else None)
-                if target_commit:
+                candidate_commits = commits if is_wt_mod else commits[1:]
+                for commit_sha in candidate_commits:
                     show_res = subprocess.run(
-                        ["git", "show", f"{target_commit}:{rel_path}"],
+                        ["git", "show", f"{commit_sha}:{rel_path}"],
                         cwd=repo_dir,
                         capture_output=True,
                         text=True,
                         encoding="utf-8",
+                        errors="replace",
                     )
                     if show_res.returncode == 0 and show_res.stdout.strip():
-                        return json.loads(show_res.stdout)
+                        try:
+                            history.append(json.loads(show_res.stdout))
+                        except Exception:
+                            pass
+                if history:
+                    return history
     except Exception:
         pass
 
-    # Fallback sidecar file (useful outside git repos)
     sidecar = current_json_path.parent / f"{current_json_path.stem}_prev.json"
     if sidecar.exists():
         try:
             with open(sidecar, "r", encoding="utf-8") as f:
-                return json.load(f)
+                return [json.load(f)]
         except Exception:
             pass
 
+    return history
+
+
+def find_previous_day_data(day_ts: str, curr_day_data: dict, prev_jsons: list[dict]) -> dict | None:
+    """
+    Find the most recent historical snapshot for `day_ts` that actually differs from `curr_day_data`.
+    Prevents tomorrow-published commits or dropped past-day commits from wiping out today's Visual Diff.
+    """
+    if not curr_day_data:
+        return None
+    for prev_json in prev_jsons:
+        prev_fact_data = prev_json.get("fact", {}).get("data", {})
+        if not isinstance(prev_fact_data, dict):
+            continue
+        if day_ts not in prev_fact_data:
+            # Stop searching once this calendar day didn't exist yet in history
+            return None
+        candidate = prev_fact_data[day_ts]
+        if candidate != curr_day_data:
+            return candidate
     return None
 
 
@@ -549,30 +593,28 @@ def main():
     today_code = today_dt.strftime("%Y-%m-%d")
 
     today_data = fact_data.get(today_ts, {})
+    if not today_data:
+        print(f"[WARN] No schedule entry for {today_str} (ts={today_ts}) in {json_path}; rendering default 'all yes'.")
     tomorrow_data = fact_data.get(tomorrow_ts)
 
-    # Load previous schedule for diff computation
-    prev_json = load_previous_json(json_path, args.prev_json)
+    # Load previous schedule revisions for per-day Visual Diff
+    prev_jsons = load_previous_jsons(json_path, args.prev_json)
     today_diff = {}
     tomorrow_diff = {}
 
-    if prev_json and "fact" in prev_json:
-        prev_fact = prev_json["fact"]
-        prev_fact_data = prev_fact.get("data", {})
-
-        # Compute diff for today if today's date also existed in previous JSON
-        if today_ts in prev_fact_data:
-            prev_today_data = prev_fact_data.get(today_ts, {})
+    if prev_jsons:
+        prev_today_data = find_previous_day_data(today_ts, today_data, prev_jsons)
+        if prev_today_data:
             today_diff = compute_schedule_diff(today_data, prev_today_data)
             if today_diff:
                 print(f"[DIFF] Detected schedule changes for {len(today_diff)} queues on {today_str}")
 
-        # Compute diff for tomorrow if tomorrow was also present in prev_json
-        if tomorrow_data and tomorrow_ts in prev_fact_data:
-            prev_tom_data = prev_fact_data.get(tomorrow_ts, {})
-            tomorrow_diff = compute_schedule_diff(tomorrow_data, prev_tom_data)
-            if tomorrow_diff:
-                print(f"[DIFF] Detected tomorrow schedule changes for {len(tomorrow_diff)} queues on {tomorrow_str}")
+        if tomorrow_data:
+            prev_tom_data = find_previous_day_data(tomorrow_ts, tomorrow_data, prev_jsons)
+            if prev_tom_data:
+                tomorrow_diff = compute_schedule_diff(tomorrow_data, prev_tom_data)
+                if tomorrow_diff:
+                    print(f"[DIFF] Detected tomorrow schedule changes for {len(tomorrow_diff)} queues on {tomorrow_str}")
 
     stats = {"checked": 0, "generated": 0, "skipped": 0}
 
@@ -643,6 +685,7 @@ def main():
         tom_placeholder_hash = calculate_hash({
             "unavailable": True,
             "tomorrow": tomorrow_str,
+            "update": last_updated,
         })
         if args.force or check_cache(hash_dir, "gpv-all-tomorrow", tom_placeholder_hash, today_code, tom_all_png):
             render_tomorrow_unavailable(tomorrow_str, last_updated, tom_all_png)
