@@ -5,11 +5,24 @@ on:
     # Run every 15 minutes
     - cron: '*/15 * * * *'
   workflow_dispatch:
+    inputs:
+      skip_parser:
+        description: 'Skip scraping ZOE (used when Home Assistant just pushed updated JSON)'
+        required: false
+        type: boolean
+        default: false
   push:
     branches:
       - main
     paths:
       - 'scripts/**'
+      - 'tests/**'
+      - 'requirements.txt'
+      - '.github/workflows/update.yml'
+
+concurrency:
+  group: update-outage-data
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -22,35 +35,39 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: main
-          fetch-depth: 0
+          fetch-depth: 30
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: 'requirements.txt'
 
       - name: Install dependencies
-        run: |
-          pip install matplotlib
+        run: pip install -r requirements.txt
+
+      - name: Run unit tests
+        if: github.event_name == 'push'
+        run: python -m unittest discover -s tests -v
 
       - name: Run parser
-        run: |
-          python scripts/parser.py
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_parser) }}
+        run: python scripts/parser.py
 
       - name: Render schedule images
-        run: |
-          python scripts/render_png.py --json data/Zaporizhzhiaoblenergo.json --out images/Zaporizhzhiaoblenergo
+        run: python scripts/render_png.py --json data/Zaporizhzhiaoblenergo.json --out images/Zaporizhzhiaoblenergo
 
       - name: Commit and push if changed
         run: |
           git config --local user.name "github-actions[bot]"
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/ images/
+          git add -A data/ images/
           if git diff --staged --quiet; then
             echo "No changes in data or images."
           else
             echo "Changes detected. Committing..."
             git commit -m "Update $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-            git pull --rebase -X ours origin main || git pull --rebase origin main
+            git pull --rebase origin main
             git push
           fi

@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
 Schedule PNG Renderer for Zaporizhzhiaoblenergo (ZOE).
-Generates visual schedule cards (PNG) for each queue and an overall summary table.
+Generates visual schedule cards (PNG) for each queue and overall summary tables (today & tomorrow).
 Supports Visual Diff (red border for increased outages, green border for decreased outages).
 Uses caching (SHA256 hashes & date check) to avoid regenerating unchanged images.
 """
 
-import os
 import sys
 import json
 import hashlib
 import argparse
 import subprocess
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 try:
@@ -42,7 +41,6 @@ COLOR_DIFF_LESS = "#2E7D32"   # Менше відключень (зелена р
 SEVERITY = {"yes": 0, "maybe": 1, "no": 2}
 
 SLOTS = list(range(1, 25))
-HOURS = [f"{i:02d}-{i+1:02d}" for i in range(24)]
 HOURS_SPLIT = [f"{i:02d}\n-\n{i+1:02d}" for i in range(24)]
 
 ALL_QUEUES = [
@@ -57,7 +55,7 @@ ALL_QUEUES = [
 MONTHS_UK = {
     1: "січня", 2: "лютого", 3: "березня", 4: "квітня",
     5: "травня", 6: "червня", 7: "липня", 8: "серпня",
-    9: "вересня", 10: "жовтня", 11: "листопада", 12: "грудня"
+    9: "вересня", 10: "жовтня", 11: "листопада", 12: "грудня",
 }
 
 
@@ -71,6 +69,23 @@ def queue_title(gpv_key: str) -> str:
     """Convert GPV1.1 to 'Черга 1.1'"""
     num = gpv_key.replace("GPV", "")
     return f"Черга {num}"
+
+
+def calc_outage_hours(slots: dict) -> float:
+    """Calculate total definite outage hours for a 24-hour slot map."""
+    total = 0.0
+    for s in SLOTS:
+        state = slots.get(str(s), "yes")
+        if state == "no":
+            total += 1.0
+        elif state in ("first", "second"):
+            total += 0.5
+    return total
+
+
+def format_hours(hours: float) -> str:
+    """Format outage hours concisely (e.g., 11 or 9.5)."""
+    return f"{int(hours)}" if hours.is_integer() else f"{hours:.1f}"
 
 
 def calculate_hash(data: dict) -> str:
@@ -147,7 +162,7 @@ def compute_queue_diff(curr_slots: dict, prev_slots: dict | None) -> dict[str, t
             p_sev = SEVERITY.get(p, 0)
             if c_sev > p_sev:
                 return "more"
-            elif c_sev < p_sev:
+            if c_sev < p_sev:
                 return "less"
             return None
 
@@ -174,11 +189,11 @@ def compute_schedule_diff(curr_day_data: dict, prev_day_data: dict | None) -> di
 
 def load_previous_json(current_json_path: Path, prev_arg: str | None = None) -> dict | None:
     """
-    Attempt to load previous schedule JSON for diff comparison.
-    Checks:
+    Load previous schedule JSON for diff comparison.
+    Priority:
     1. Explicit --prev-json argument if supplied
-    2. Sidecar file data/<stem>_prev.json
-    3. Git history for the previous revision of the json file
+    2. Git history for the previous revision of the json file (handles both GHA and HA pushes)
+    3. Sidecar file <stem>_prev.json when running outside a git repository
     """
     if prev_arg:
         p = Path(prev_arg)
@@ -189,7 +204,48 @@ def load_previous_json(current_json_path: Path, prev_arg: str | None = None) -> 
             except Exception as e:
                 print(f"[WARN] Failed to read --prev-json: {e}")
 
-    # Check sidecar file in same directory
+    # Check git history first so HA API commits are always diffed accurately
+    try:
+        resolved = current_json_path.resolve()
+        top_res = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=resolved.parent,
+            capture_output=True,
+            text=True,
+        )
+        if top_res.returncode == 0 and top_res.stdout.strip():
+            repo_dir = Path(top_res.stdout.strip()).resolve()
+            rel_path = resolved.relative_to(repo_dir).as_posix()
+            log_res = subprocess.run(
+                ["git", "log", "-n", "3", "--format=%H", "--", rel_path],
+                cwd=repo_dir,
+                capture_output=True,
+                text=True,
+            )
+            if log_res.returncode == 0:
+                commits = [line.strip() for line in log_res.stdout.splitlines() if line.strip()]
+                diff_res = subprocess.run(
+                    ["git", "diff", "--name-only", "--", rel_path],
+                    cwd=repo_dir,
+                    capture_output=True,
+                    text=True,
+                )
+                is_wt_mod = bool(diff_res.stdout.strip())
+                target_commit = commits[0] if is_wt_mod else (commits[1] if len(commits) > 1 else None)
+                if target_commit:
+                    show_res = subprocess.run(
+                        ["git", "show", f"{target_commit}:{rel_path}"],
+                        cwd=repo_dir,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                    )
+                    if show_res.returncode == 0 and show_res.stdout.strip():
+                        return json.loads(show_res.stdout)
+    except Exception:
+        pass
+
+    # Fallback sidecar file (useful outside git repos)
     sidecar = current_json_path.parent / f"{current_json_path.stem}_prev.json"
     if sidecar.exists():
         try:
@@ -198,32 +254,11 @@ def load_previous_json(current_json_path: Path, prev_arg: str | None = None) -> 
         except Exception:
             pass
 
-    # Check git history
-    try:
-        repo_dir = current_json_path.parent.parent
-        rel_path = f"data/{current_json_path.name}"
-        cmd = ["git", "log", "-n", "3", "--format=%H", "--", rel_path]
-        p = subprocess.run(cmd, cwd=repo_dir, capture_output=True, text=True)
-        if p.returncode == 0:
-            commits = [line.strip() for line in p.stdout.splitlines() if line.strip()]
-            diff_cmd = ["git", "diff", "--name-only", "--", rel_path]
-            d_res = subprocess.run(diff_cmd, cwd=repo_dir, capture_output=True, text=True)
-            is_wt_mod = rel_path in d_res.stdout or current_json_path.name in d_res.stdout
-
-            target_commit = commits[0] if is_wt_mod else (commits[1] if len(commits) > 1 else None)
-            if target_commit:
-                s = subprocess.run(["git", "show", f"{target_commit}:{rel_path}"], cwd=repo_dir, capture_output=True, text=True)
-                if s.returncode == 0 and s.stdout.strip():
-                    return json.loads(s.stdout)
-    except Exception:
-        pass
-
     return None
 
 
 def draw_slot(ax, x, y, w, h, state: str, diff: tuple[str | None, str | None] | None = None):
     """Draw a single hour slot with half-hour support and optional visual diff borders."""
-    # Base white cell
     ax.add_patch(Rectangle((x, y), w, h, linewidth=0, facecolor=COLOR_AVAILABLE, zorder=1))
 
     if state == "no":
@@ -246,7 +281,6 @@ def draw_slot(ax, x, y, w, h, state: str, diff: tuple[str | None, str | None] | 
     if diff:
         d1, d2 = diff
         if d1 and d1 == d2:
-            # Full cell changed in the same direction
             color = COLOR_DIFF_MORE if d1 == "more" else COLOR_DIFF_LESS
             ax.add_patch(Rectangle((x, y), w, h, linewidth=2.5, edgecolor=color, facecolor="none", zorder=5))
         else:
@@ -258,43 +292,78 @@ def draw_slot(ax, x, y, w, h, state: str, diff: tuple[str | None, str | None] | 
                 ax.add_patch(Rectangle((x + w / 2, y), w / 2, h, linewidth=2.5, edgecolor=color, facecolor="none", zorder=5))
 
 
-def render_single_queue(today_slots: dict, tomorrow_slots: dict | None, gkey: str,
-                        today_str: str, tomorrow_str: str | None, last_updated: str,
-                        output_path: Path, today_diff: dict | None = None, tomorrow_diff: dict | None = None):
-    """Render 2-day schedule for a single queue with Visual Diff support."""
-    fig, ax = plt.subplots(figsize=(20, 3.6), dpi=130)
+def draw_legend(fig, leg_y: float, box_h: float, last_updated: str):
+    """Draw shared legend row and update timestamp."""
+    leg_x = 0.035
+    box_w = 0.018
+
+    items = [
+        (0.0, 0.8, COLOR_BORDER, COLOR_AVAILABLE, "Електроенергія є"),
+        (0.125, 0.8, COLOR_BORDER, COLOR_OUTAGE, "Відключення"),
+        (0.115, 0.8, COLOR_BORDER, COLOR_MAYBE, "Можливе відключення"),
+        (0.155, 2.0, COLOR_DIFF_MORE, COLOR_AVAILABLE, "Більше відключень"),
+        (0.15, 2.0, COLOR_DIFF_LESS, COLOR_AVAILABLE, "Менше відключень"),
+    ]
+    for dx, lw, ec, fc, label in items:
+        leg_x += dx
+        fig.patches.append(
+            Rectangle(
+                (leg_x, leg_y), box_w, box_h,
+                linewidth=lw, edgecolor=ec, facecolor=fc,
+                transform=fig.transFigure, clip_on=False,
+            )
+        )
+        fig.text(leg_x + box_w + 0.005, leg_y + box_h / 2, label, fontsize=10, va="center")
+
+    if last_updated:
+        fig.text(
+            0.965, leg_y + box_h / 2,
+            f"Опубліковано: {last_updated}",
+            fontsize=10, ha="right", va="center", style="italic", color="#555555",
+        )
+
+
+def render_single_queue(
+    today_slots: dict, tomorrow_slots: dict | None, gkey: str,
+    today_str: str, tomorrow_str: str | None, last_updated: str,
+    output_path: Path, today_diff: dict | None = None, tomorrow_diff: dict | None = None,
+):
+    """Render 2-day schedule for a single queue with Visual Diff and total outage hours."""
+    fig, ax = plt.subplots(figsize=(20.5, 3.6), dpi=130)
     fig.patch.set_facecolor("#FFFFFF")
     ax.set_facecolor("#FFFFFF")
 
     cell_w = 1.0
     cell_h = 0.52
     label_w = 2.4
+    total_w = 1.35
     header_h = 0.95
 
     has_tomorrow = bool(tomorrow_slots)
     rows_count = 2 if has_tomorrow else 1
 
-    table_width = label_w + 24 * cell_w
+    table_width = label_w + 24 * cell_w + total_w
     table_height = header_h + rows_count * cell_h
 
     y_pos = 0
 
     # Row 0: Hours Header
-    rect = Rectangle((0, y_pos), label_w, header_h, linewidth=1, edgecolor=COLOR_BORDER, facecolor=COLOR_HEADER)
-    ax.add_patch(rect)
+    ax.add_patch(Rectangle((0, y_pos), label_w, header_h, linewidth=1, edgecolor=COLOR_BORDER, facecolor=COLOR_HEADER))
     ax.text(label_w / 2, y_pos + header_h / 2, "Дата", fontsize=12, ha="center", va="center", fontweight="bold")
 
     for i in range(24):
         x = label_w + i * cell_w
-        rect = Rectangle((x, y_pos), cell_w, header_h, linewidth=1, edgecolor=COLOR_BORDER, facecolor=COLOR_HEADER)
-        ax.add_patch(rect)
+        ax.add_patch(Rectangle((x, y_pos), cell_w, header_h, linewidth=1, edgecolor=COLOR_BORDER, facecolor=COLOR_HEADER))
         ax.text(x + cell_w / 2, y_pos + header_h / 2, HOURS_SPLIT[i], fontsize=10.5, ha="center", va="center", fontweight="bold", linespacing=1.3)
+
+    x_tot = label_w + 24 * cell_w
+    ax.add_patch(Rectangle((x_tot, y_pos), total_w, header_h, linewidth=1, edgecolor=COLOR_BORDER, facecolor=COLOR_HEADER))
+    ax.text(x_tot + total_w / 2, y_pos + header_h / 2, "Без\nсвітла", fontsize=10, ha="center", va="center", fontweight="bold")
 
     y_pos += header_h
 
     # Row 1: Today
-    rect = Rectangle((0, y_pos), label_w, cell_h, linewidth=1, edgecolor=COLOR_BORDER, facecolor=COLOR_LABEL)
-    ax.add_patch(rect)
+    ax.add_patch(Rectangle((0, y_pos), label_w, cell_h, linewidth=1, edgecolor=COLOR_BORDER, facecolor=COLOR_LABEL))
     ax.text(label_w / 2, y_pos + cell_h / 2, today_str, fontsize=11.5, ha="center", va="center", fontweight="bold")
 
     for i, s_num in enumerate(SLOTS):
@@ -303,12 +372,15 @@ def render_single_queue(today_slots: dict, tomorrow_slots: dict | None, gkey: st
         diff = today_diff.get(str(s_num)) if today_diff else None
         draw_slot(ax, x, y_pos, cell_w, cell_h, state, diff=diff)
 
+    today_hrs = format_hours(calc_outage_hours(today_slots))
+    ax.add_patch(Rectangle((x_tot, y_pos), total_w, cell_h, linewidth=1, edgecolor=COLOR_BORDER, facecolor=COLOR_LABEL))
+    ax.text(x_tot + total_w / 2, y_pos + cell_h / 2, f"{today_hrs} г", fontsize=10.5, ha="center", va="center", fontweight="bold")
+
     y_pos += cell_h
 
     # Row 2: Tomorrow (if available)
     if has_tomorrow:
-        rect = Rectangle((0, y_pos), label_w, cell_h, linewidth=1, edgecolor=COLOR_BORDER, facecolor=COLOR_LABEL)
-        ax.add_patch(rect)
+        ax.add_patch(Rectangle((0, y_pos), label_w, cell_h, linewidth=1, edgecolor=COLOR_BORDER, facecolor=COLOR_LABEL))
         ax.text(label_w / 2, y_pos + cell_h / 2, tomorrow_str, fontsize=11.5, ha="center", va="center", fontweight="bold")
 
         for i, s_num in enumerate(SLOTS):
@@ -317,57 +389,26 @@ def render_single_queue(today_slots: dict, tomorrow_slots: dict | None, gkey: st
             diff = tomorrow_diff.get(str(s_num)) if tomorrow_diff else None
             draw_slot(ax, x, y_pos, cell_w, cell_h, state, diff=diff)
 
+        tom_hrs = format_hours(calc_outage_hours(tomorrow_slots))
+        ax.add_patch(Rectangle((x_tot, y_pos), total_w, cell_h, linewidth=1, edgecolor=COLOR_BORDER, facecolor=COLOR_LABEL))
+        ax.text(x_tot + total_w / 2, y_pos + cell_h / 2, f"{tom_hrs} г", fontsize=10.5, ha="center", va="center", fontweight="bold")
+
     pad_x = 0.04
     pad_y = 0.04
     ax.set_xlim(-pad_x, table_width + pad_x)
     ax.set_ylim(table_height + pad_y, -pad_y)
     ax.axis("off")
 
-    # Clean outer border framing the table
     ax.add_patch(Rectangle((0, 0), table_width, table_height, linewidth=1.5, edgecolor=COLOR_BORDER, facecolor="none"))
 
-    # Header title
     fig.text(0.04, 0.96, "Графік відключень: Запоріжжя та область", fontsize=17, fontweight="bold")
+    fig.text(
+        0.96, 0.96, queue_title(gkey), fontsize=17, fontweight="bold",
+        bbox=dict(boxstyle="round,pad=0.5", facecolor="#FFD700", edgecolor="#000000", linewidth=1.5),
+        ha="right",
+    )
 
-    # Queue badge pill
-    q_badge = queue_title(gkey)
-    fig.text(0.96, 0.96, q_badge, fontsize=17, fontweight="bold",
-             bbox=dict(boxstyle="round,pad=0.5", facecolor="#FFD700", edgecolor="#000000", linewidth=1.5),
-             ha="right")
-
-    # Legend at bottom
-    leg_y = 0.03
-    leg_x = 0.035
-    box_w = 0.018
-    box_h = 0.055
-
-    # 1. Електроенергія є
-    fig.patches.append(Rectangle((leg_x, leg_y), box_w, box_h, linewidth=0.8, edgecolor=COLOR_BORDER, facecolor=COLOR_AVAILABLE, transform=fig.transFigure, clip_on=False))
-    fig.text(leg_x + box_w + 0.005, leg_y + box_h / 2, "Електроенергія є", fontsize=10, va="center")
-
-    # 2. Відключення
-    leg_x += 0.125
-    fig.patches.append(Rectangle((leg_x, leg_y), box_w, box_h, linewidth=0.8, edgecolor=COLOR_BORDER, facecolor=COLOR_OUTAGE, transform=fig.transFigure, clip_on=False))
-    fig.text(leg_x + box_w + 0.005, leg_y + box_h / 2, "Відключення", fontsize=10, va="center")
-
-    # 3. Можливе відключення
-    leg_x += 0.115
-    fig.patches.append(Rectangle((leg_x, leg_y), box_w, box_h, linewidth=0.8, edgecolor=COLOR_BORDER, facecolor=COLOR_MAYBE, transform=fig.transFigure, clip_on=False))
-    fig.text(leg_x + box_w + 0.005, leg_y + box_h / 2, "Можливе відключення", fontsize=10, va="center")
-
-    # 4. Більше відключень (diff)
-    leg_x += 0.155
-    fig.patches.append(Rectangle((leg_x, leg_y), box_w, box_h, linewidth=2.0, edgecolor=COLOR_DIFF_MORE, facecolor=COLOR_AVAILABLE, transform=fig.transFigure, clip_on=False))
-    fig.text(leg_x + box_w + 0.005, leg_y + box_h / 2, "Більше відключень", fontsize=10, va="center")
-
-    # 5. Менше відключень (diff)
-    leg_x += 0.15
-    fig.patches.append(Rectangle((leg_x, leg_y), box_w, box_h, linewidth=2.0, edgecolor=COLOR_DIFF_LESS, facecolor=COLOR_AVAILABLE, transform=fig.transFigure, clip_on=False))
-    fig.text(leg_x + box_w + 0.005, leg_y + box_h / 2, "Менше відключень", fontsize=10, va="center")
-
-    # Update timestamp
-    if last_updated:
-        fig.text(0.965, leg_y + box_h / 2, f"Опубліковано: {last_updated}", fontsize=10, ha="right", va="center", style="italic", color="#555555")
+    draw_legend(fig, leg_y=0.03, box_h=0.055, last_updated=last_updated)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, facecolor="#FFFFFF", dpi=130, bbox_inches="tight", pad_inches=0.15)
@@ -375,31 +416,34 @@ def render_single_queue(today_slots: dict, tomorrow_slots: dict | None, gkey: st
 
 
 def render_all_queues_summary(day_data: dict, date_str: str, last_updated: str, output_path: Path, day_diff: dict | None = None):
-    """Render overview chart of all 12 queues on a single day with Visual Diff support."""
-    fig, ax = plt.subplots(figsize=(20, 8.5), dpi=130)
+    """Render overview chart of all 12 queues on a single day with Visual Diff and outage hours."""
+    fig, ax = plt.subplots(figsize=(20.5, 8.5), dpi=130)
     fig.patch.set_facecolor("#FFFFFF")
     ax.set_facecolor("#FFFFFF")
 
     cell_w = 1.0
     cell_h = 0.48
     label_w = 2.2
+    total_w = 1.35
     header_h = 0.85
 
-    table_width = label_w + 24 * cell_w
+    table_width = label_w + 24 * cell_w + total_w
     table_height = header_h + len(ALL_QUEUES) * cell_h
 
     y_pos = 0
 
     # Row 0: Hours
-    rect = Rectangle((0, y_pos), label_w, header_h, linewidth=1, edgecolor=COLOR_BORDER, facecolor=COLOR_HEADER)
-    ax.add_patch(rect)
+    ax.add_patch(Rectangle((0, y_pos), label_w, header_h, linewidth=1, edgecolor=COLOR_BORDER, facecolor=COLOR_HEADER))
     ax.text(label_w / 2, y_pos + header_h / 2, "Черга", fontsize=12, ha="center", va="center", fontweight="bold")
 
     for i in range(24):
         x = label_w + i * cell_w
-        rect = Rectangle((x, y_pos), cell_w, header_h, linewidth=1, edgecolor=COLOR_BORDER, facecolor=COLOR_HEADER)
-        ax.add_patch(rect)
+        ax.add_patch(Rectangle((x, y_pos), cell_w, header_h, linewidth=1, edgecolor=COLOR_BORDER, facecolor=COLOR_HEADER))
         ax.text(x + cell_w / 2, y_pos + header_h / 2, HOURS_SPLIT[i], fontsize=10, ha="center", va="center", fontweight="bold", linespacing=1.2)
+
+    x_tot = label_w + 24 * cell_w
+    ax.add_patch(Rectangle((x_tot, y_pos), total_w, header_h, linewidth=1, edgecolor=COLOR_BORDER, facecolor=COLOR_HEADER))
+    ax.text(x_tot + total_w / 2, y_pos + header_h / 2, "Без\nсвітла", fontsize=10, ha="center", va="center", fontweight="bold")
 
     y_pos += header_h
 
@@ -409,8 +453,7 @@ def render_all_queues_summary(day_data: dict, date_str: str, last_updated: str, 
         q_slots = day_data.get(gkey, {str(s): "yes" for s in SLOTS})
         q_diff = day_diff.get(gkey, {}) if day_diff else {}
 
-        rect = Rectangle((0, y_pos), label_w, cell_h, linewidth=1, edgecolor=COLOR_BORDER, facecolor=COLOR_LABEL)
-        ax.add_patch(rect)
+        ax.add_patch(Rectangle((0, y_pos), label_w, cell_h, linewidth=1, edgecolor=COLOR_BORDER, facecolor=COLOR_LABEL))
         ax.text(label_w / 2, y_pos + cell_h / 2, q_label, fontsize=11, ha="center", va="center", fontweight="bold")
 
         for i, s_num in enumerate(SLOTS):
@@ -418,6 +461,10 @@ def render_all_queues_summary(day_data: dict, date_str: str, last_updated: str, 
             state = q_slots.get(str(s_num), "yes")
             diff = q_diff.get(str(s_num))
             draw_slot(ax, x, y_pos, cell_w, cell_h, state, diff=diff)
+
+        q_hrs = format_hours(calc_outage_hours(q_slots))
+        ax.add_patch(Rectangle((x_tot, y_pos), total_w, cell_h, linewidth=1, edgecolor=COLOR_BORDER, facecolor=COLOR_LABEL))
+        ax.text(x_tot + total_w / 2, y_pos + cell_h / 2, f"{q_hrs} г", fontsize=10.5, ha="center", va="center", fontweight="bold")
 
         y_pos += cell_h
 
@@ -427,45 +474,33 @@ def render_all_queues_summary(day_data: dict, date_str: str, last_updated: str, 
     ax.set_ylim(table_height + pad_y, -pad_y)
     ax.axis("off")
 
-    # Clean outer border framing the table
     ax.add_patch(Rectangle((0, 0), table_width, table_height, linewidth=1.5, edgecolor=COLOR_BORDER, facecolor="none"))
 
-    # Header title
-    fig.text(0.04, 0.97, f"Графік відключень (всі черги): Запоріжжя та область", fontsize=17, fontweight="bold")
+    fig.text(0.04, 0.97, "Графік відключень (всі черги): Запоріжжя та область", fontsize=17, fontweight="bold")
     fig.text(0.96, 0.97, f"Дата: {date_str}", fontsize=16, fontweight="bold", ha="right")
 
-    # Legend at bottom
-    leg_y = 0.02
-    leg_x = 0.035
-    box_w = 0.018
-    box_h = 0.025
+    draw_legend(fig, leg_y=0.02, box_h=0.025, last_updated=last_updated)
 
-    # 1. Електроенергія є
-    fig.patches.append(Rectangle((leg_x, leg_y), box_w, box_h, linewidth=0.8, edgecolor=COLOR_BORDER, facecolor=COLOR_AVAILABLE, transform=fig.transFigure, clip_on=False))
-    fig.text(leg_x + box_w + 0.005, leg_y + box_h / 2, "Електроенергія є", fontsize=10, va="center")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_path, facecolor="#FFFFFF", dpi=130, bbox_inches="tight", pad_inches=0.15)
+    plt.close(fig)
 
-    # 2. Відключення
-    leg_x += 0.125
-    fig.patches.append(Rectangle((leg_x, leg_y), box_w, box_h, linewidth=0.8, edgecolor=COLOR_BORDER, facecolor=COLOR_OUTAGE, transform=fig.transFigure, clip_on=False))
-    fig.text(leg_x + box_w + 0.005, leg_y + box_h / 2, "Відключення", fontsize=10, va="center")
 
-    # 3. Можливе відключення
-    leg_x += 0.115
-    fig.patches.append(Rectangle((leg_x, leg_y), box_w, box_h, linewidth=0.8, edgecolor=COLOR_BORDER, facecolor=COLOR_MAYBE, transform=fig.transFigure, clip_on=False))
-    fig.text(leg_x + box_w + 0.005, leg_y + box_h / 2, "Можливе відключення", fontsize=10, va="center")
+def render_tomorrow_unavailable(tomorrow_str: str, last_updated: str, output_path: Path):
+    """Render clean placeholder image when tomorrow's schedule is not yet published."""
+    fig, ax = plt.subplots(figsize=(14, 3.2), dpi=130)
+    fig.patch.set_facecolor("#FFFFFF")
+    ax.set_facecolor("#F7F9FC")
 
-    # 4. Більше відключень (diff)
-    leg_x += 0.155
-    fig.patches.append(Rectangle((leg_x, leg_y), box_w, box_h, linewidth=2.0, edgecolor=COLOR_DIFF_MORE, facecolor=COLOR_AVAILABLE, transform=fig.transFigure, clip_on=False))
-    fig.text(leg_x + box_w + 0.005, leg_y + box_h / 2, "Більше відключень", fontsize=10, va="center")
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 3)
+    ax.axis("off")
+    ax.add_patch(Rectangle((0.1, 0.25), 9.8, 2.5, linewidth=1.5, edgecolor=COLOR_BORDER, facecolor="#F7F9FC"))
 
-    # 5. Менше відключень (diff)
-    leg_x += 0.15
-    fig.patches.append(Rectangle((leg_x, leg_y), box_w, box_h, linewidth=2.0, edgecolor=COLOR_DIFF_LESS, facecolor=COLOR_AVAILABLE, transform=fig.transFigure, clip_on=False))
-    fig.text(leg_x + box_w + 0.005, leg_y + box_h / 2, "Менше відключень", fontsize=10, va="center")
-
+    ax.text(5.0, 1.85, f"Графік відключень на {tomorrow_str} ще не опубліковано", fontsize=17, fontweight="bold", ha="center", va="center", color="#222222")
+    ax.text(5.0, 1.1, "Дані оновляться автоматично одразу після публікації АТ «Запоріжжяобленерго»", fontsize=12, ha="center", va="center", color="#555555")
     if last_updated:
-        fig.text(0.965, leg_y + box_h / 2, f"Опубліковано: {last_updated}", fontsize=10, ha="right", va="center", style="italic", color="#555555")
+        ax.text(9.75, 0.45, f"Останнє оновлення: {last_updated}", fontsize=10, ha="right", va="center", style="italic", color="#666666")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, facecolor="#FFFFFF", dpi=130, bbox_inches="tight", pad_inches=0.15)
@@ -496,9 +531,13 @@ def main():
     last_updated = fact.get("update", "")
     today_ts = str(fact.get("today", ""))
 
+    now_kyiv_midnight = datetime.now(TZ_KYIV).replace(hour=0, minute=0, second=0, microsecond=0)
+    actual_today_ts = str(int(now_kyiv_midnight.timestamp()))
+
     if not today_ts or today_ts not in fact_data:
-        now_kyiv = datetime.now(TZ_KYIV).replace(hour=0, minute=0, second=0, microsecond=0)
-        today_ts = str(int(now_kyiv.timestamp()))
+        today_ts = actual_today_ts
+    elif int(today_ts) < int(actual_today_ts) and actual_today_ts in fact_data:
+        today_ts = actual_today_ts
 
     today_dt = datetime.fromtimestamp(int(today_ts), tz=TZ_KYIV)
     tomorrow_date = today_dt.date() + timedelta(days=1)
@@ -512,7 +551,7 @@ def main():
     today_data = fact_data.get(today_ts, {})
     tomorrow_data = fact_data.get(tomorrow_ts)
 
-    # Attempt to load previous schedule for diff computation
+    # Load previous schedule for diff computation
     prev_json = load_previous_json(json_path, args.prev_json)
     today_diff = {}
     tomorrow_diff = {}
@@ -520,11 +559,9 @@ def main():
     if prev_json and "fact" in prev_json:
         prev_fact = prev_json["fact"]
         prev_fact_data = prev_fact.get("data", {})
-        prev_today_ts = str(prev_fact.get("today", ""))
 
-        # Only compute diff for today if previous JSON was also for the same calendar date
-        # (prevents spurious red/green borders on midnight day rollover)
-        if prev_today_ts == today_ts:
+        # Compute diff for today if today's date also existed in previous JSON
+        if today_ts in prev_fact_data:
             prev_today_data = prev_fact_data.get(today_ts, {})
             today_diff = compute_schedule_diff(today_data, prev_today_data)
             if today_diff:
@@ -562,12 +599,9 @@ def main():
                 q_today, q_tomorrow, gkey,
                 today_str, tomorrow_str if q_tomorrow else None,
                 last_updated, target_png,
-                today_diff=q_tdiff, tomorrow_diff=q_tomdiff
+                today_diff=q_tdiff, tomorrow_diff=q_tomdiff,
             )
             save_cache(hash_dir, gkey, q_hash, today_code)
-            if out_dir.name != "images" and out_dir.parent.name == "images":
-                import shutil
-                shutil.copy2(target_png, out_dir.parent / fname)
             stats["generated"] += 1
             print(f"[RENDERED] {fname}")
         else:
@@ -584,31 +618,37 @@ def main():
     if args.force or check_cache(hash_dir, "gpv-all-today", today_all_hash, today_code, today_all_png):
         render_all_queues_summary(today_data, today_str, last_updated, today_all_png, day_diff=today_diff)
         save_cache(hash_dir, "gpv-all-today", today_all_hash, today_code)
-        if out_dir.name != "images" and out_dir.parent.name == "images":
-            import shutil
-            shutil.copy2(today_all_png, out_dir.parent / "gpv-all-today.png")
         stats["generated"] += 1
-        print(f"[RENDERED] gpv-all-today.png")
+        print("[RENDERED] gpv-all-today.png")
     else:
         stats["skipped"] += 1
 
-    # 3. Render all-queues overview for tomorrow if tomorrow data exists
+    # 3. Render all-queues overview for tomorrow (or placeholder when unavailable)
+    stats["checked"] += 1
+    tom_all_png = out_dir / "gpv-all-tomorrow.png"
     if tomorrow_data:
-        stats["checked"] += 1
         tom_all_hash = calculate_hash({
             "data": tomorrow_data,
             "update": last_updated,
             "diff": tomorrow_diff,
         })
-        tom_all_png = out_dir / "gpv-all-tomorrow.png"
         if args.force or check_cache(hash_dir, "gpv-all-tomorrow", tom_all_hash, today_code, tom_all_png):
             render_all_queues_summary(tomorrow_data, tomorrow_str, last_updated, tom_all_png, day_diff=tomorrow_diff)
             save_cache(hash_dir, "gpv-all-tomorrow", tom_all_hash, today_code)
-            if out_dir.name != "images" and out_dir.parent.name == "images":
-                import shutil
-                shutil.copy2(tom_all_png, out_dir.parent / "gpv-all-tomorrow.png")
             stats["generated"] += 1
-            print(f"[RENDERED] gpv-all-tomorrow.png")
+            print("[RENDERED] gpv-all-tomorrow.png")
+        else:
+            stats["skipped"] += 1
+    else:
+        tom_placeholder_hash = calculate_hash({
+            "unavailable": True,
+            "tomorrow": tomorrow_str,
+        })
+        if args.force or check_cache(hash_dir, "gpv-all-tomorrow", tom_placeholder_hash, today_code, tom_all_png):
+            render_tomorrow_unavailable(tomorrow_str, last_updated, tom_all_png)
+            save_cache(hash_dir, "gpv-all-tomorrow", tom_placeholder_hash, today_code)
+            stats["generated"] += 1
+            print("[RENDERED] gpv-all-tomorrow.png (placeholder)")
         else:
             stats["skipped"] += 1
 

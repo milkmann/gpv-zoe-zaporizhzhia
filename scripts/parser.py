@@ -12,6 +12,7 @@ import sys
 import json
 import time
 import html as html_lib
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -23,6 +24,8 @@ MONTHS_UA = {
     "травня": 5, "червня": 6, "липня": 7, "серпня": 8,
     "вересня": 9, "жовтня": 10, "листопада": 11, "грудня": 12,
 }
+MONTH_PATTERN = "|".join(MONTHS_UA.keys())
+DATE_RE = re.compile(rf"(\d{{1,2}})\s+({MONTH_PATTERN})\b", re.IGNORECASE)
 
 ALL_QUEUES = [
     "GPV1.1", "GPV1.2",
@@ -37,7 +40,7 @@ DEFAULT_TIME_ZONE = {
     str(i): [
         f"{i-1:02d}-{i:02d}",
         f"{i-1:02d}:00",
-        f"{i:02d}:00" if i < 24 else "24:00"
+        f"{i:02d}:00" if i < 24 else "24:00",
     ]
     for i in range(1, 25)
 }
@@ -49,11 +52,12 @@ DEFAULT_TIME_TYPE = {
     "first": "Відключення перші 30 хв.",
     "second": "Відключення другі 30 хв.",
     "mfirst": "Можливе відключення перші 30 хв.",
-    "msecond": "Можливе відключення другі 30 хв."
+    "msecond": "Можливе відключення другі 30 хв.",
 }
 
 URL_ZOE_OUTAGE = "https://www.zoe.com.ua/outage/"
 FALLBACK_URL = "https://raw.githubusercontent.com/yaroslav2901/OE_OUTAGE_DATA/main/data/Zaporizhzhiaoblenergo.json"
+FRESH_DATA_MAX_AGE_DAYS = 2
 
 
 def parse_update_datetime(upd_str: str | None) -> datetime | None:
@@ -76,6 +80,49 @@ def parse_update_datetime(upd_str: str | None) -> datetime | None:
     return None
 
 
+def resolve_update_datetime(target_date: datetime, upd_match: re.Match | None, now_kyiv: datetime) -> str:
+    """Resolve article update timestamp without placing evening updates for tomorrow in the future."""
+    if upd_match:
+        h, m = map(int, upd_match.group(1).split(":"))
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            candidate = target_date.replace(hour=h, minute=m, second=0, microsecond=0)
+            if candidate > now_kyiv + timedelta(minutes=10):
+                candidate = now_kyiv.replace(hour=h, minute=m, second=0, microsecond=0)
+                if candidate > now_kyiv + timedelta(minutes=10):
+                    candidate -= timedelta(days=1)
+            return candidate.strftime("%d.%m.%Y %H:%M")
+    if target_date.date() > now_kyiv.date():
+        return now_kyiv.strftime("%d.%m.%Y %H:%M")
+    return target_date.strftime("%d.%m.%Y 00:00")
+
+
+def is_no_outages_notice(clean_title: str, clean_body: str) -> bool:
+    """Return True if an article without queue lines explicitly states GPV will not apply to population."""
+    text = f"{clean_title}\n{clean_body}".lower()
+    if "продовжують діяти" in text:
+        return False
+
+    strong_keywords = (
+        "не стосуються населення",
+        "не заплановано",
+        "не вводитимуться",
+        "відключення відсутні",
+        "без відключень",
+        "обмежень не передбачено",
+    )
+    if any(k in text for k in strong_keywords):
+        return True
+
+    if "скасован" in text:
+        emergency_markers = ("аварійних відключень", "гав", "сгав")
+        gpv_markers = ("гпв", "погодинних відключень")
+        if any(m in text for m in emergency_markers) and not any(m in text for m in gpv_markers):
+            return False
+        return True
+
+    return False
+
+
 def fetch_fallback_data() -> tuple[dict, str | None] | None:
     """Fetch from backup source if official site is geo-blocked for cloud runners."""
     try:
@@ -94,8 +141,8 @@ def fetch_fallback_data() -> tuple[dict, str | None] | None:
     return None
 
 
-def fetch_html_with_retries(url: str, retries: int = 3, timeout: int = 20) -> str:
-    """Fetch HTML content with browser-like headers and retries."""
+def fetch_html_with_retries(url: str, retries: int = 2, timeout: int = 10) -> str:
+    """Fetch HTML content with browser-like headers, standard TLS first, and retries."""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -108,8 +155,6 @@ def fetch_html_with_retries(url: str, retries: int = 3, timeout: int = 20) -> st
         "Pragma": "no-cache",
     }
     ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
 
     last_err = None
     for attempt in range(1, retries + 1):
@@ -119,6 +164,25 @@ def fetch_html_with_retries(url: str, retries: int = 3, timeout: int = 20) -> st
                 if resp.status == 200:
                     return resp.read().decode("utf-8", errors="replace")
                 print(f"[WARN] Attempt {attempt}: HTTP {resp.status}")
+        except urllib.error.URLError as e:
+            if isinstance(e.reason, ssl.SSLCertVerificationError) and ctx.verify_mode != ssl.CERT_NONE:
+                print(f"[WARN] SSL verification failed ({e.reason}); retrying with unverified TLS context...")
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                try:
+                    req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
+                        if resp.status == 200:
+                            return resp.read().decode("utf-8", errors="replace")
+                except Exception as inner_e:
+                    last_err = inner_e
+                    print(f"[WARN] Attempt {attempt} (unverified TLS) failed: {inner_e}")
+            else:
+                last_err = e
+                print(f"[WARN] Attempt {attempt} failed: {e}")
+            if attempt < retries:
+                time.sleep(attempt * 2)
         except Exception as e:
             last_err = e
             print(f"[WARN] Attempt {attempt} failed: {e}")
@@ -141,14 +205,13 @@ def parse_time_intervals(intervals_str: str) -> list[tuple[tuple[int, int], tupl
 
 def intervals_to_hours(intervals: list[tuple[tuple[int, int], tuple[int, int]]]) -> dict[str, str]:
     """Convert intervals to DTEK 24-hour dictionary ('1' to '24') with half-hour resolution."""
-    # 48 half-hour slots per day
     slots = [False] * 48
     for (sh, sm), (eh, em) in intervals:
         start_slot = sh * 2 + (1 if sm >= 30 else 0)
         end_slot = eh * 2 + (1 if 0 < em <= 30 else (2 if em > 30 else 0))
-        if eh == 24 or (eh == 23 and em >= 59):
+        if eh == 24 or (eh == 23 and em >= 59) or (eh == 0 and em == 0 and (sh > 0 or sm > 0)):
             end_slot = 48
-        for s in range(start_slot, min(end_slot, 48)):
+        for s in range(max(0, start_slot), min(end_slot, 48)):
             slots[s] = True
 
     hours = {}
@@ -190,26 +253,23 @@ def parse_outages_from_html(html: str, now_kyiv: datetime | None = None) -> tupl
         content_newlines = re.sub(r"<\s*(?:br|/?p|/?div|/?li|/?tr)\b[^>]*>", "\n", content, flags=re.IGNORECASE)
         clean_body = html_lib.unescape(re.sub(r"<[^>]+>", " ", content_newlines))
 
-        # Find date
-        date_match = re.search(r"(\d{1,2})\s+([а-яіїєА-ЯІЇЄ]+)", clean_title)
-        if not date_match:
-            date_match = re.search(r"(\d{1,2})\s+([а-яіїєА-ЯІЇЄ]+)", clean_body)
+        date_match = DATE_RE.search(clean_title) or DATE_RE.search(clean_body)
         if not date_match:
             continue
 
         day_num = int(date_match.group(1))
-        month_name = date_match.group(2).lower()
-        if month_name not in MONTHS_UA:
-            continue
+        month_num = MONTHS_UA[date_match.group(2).lower()]
 
-        month_num = MONTHS_UA[month_name]
         article_year = year
         if now_kyiv.month == 12 and month_num == 1:
             article_year = year + 1
         elif now_kyiv.month == 1 and month_num == 12:
             article_year = year - 1
 
-        target_date = datetime(article_year, month_num, day_num, 0, 0, tzinfo=TZ_KYIV)
+        try:
+            target_date = datetime(article_year, month_num, day_num, 0, 0, tzinfo=TZ_KYIV)
+        except ValueError:
+            continue
         day_ts = str(int(target_date.timestamp()))
 
         # If already parsed a newer article for this day, skip earlier updates
@@ -230,63 +290,55 @@ def parse_outages_from_html(html: str, now_kyiv: datetime | None = None) -> tupl
             upd_match = re.search(r"оновлено\s*(?:о\s*)?(\d{1,2}:\d{2})", clean_title + " " + clean_body, re.IGNORECASE)
             if not upd_match:
                 upd_match = re.search(r"(?:станом на|опубліковано|час[:\s]+)\s*(\d{1,2}:\d{2})", clean_body, re.IGNORECASE)
-            upd_time = upd_match.group(1) if upd_match else "00:00"
-            update_dt = f"{day_num:02d}.{month_num:02d}.{article_year} {upd_time}"
+            update_dt = resolve_update_datetime(target_date, upd_match, now_kyiv)
 
             if latest_update_str is None:
                 latest_update_str = update_dt
 
-            day_queues = {q: {str(i): "yes" for i in range(1, 25)} for q in ALL_QUEUES}
+            queue_intervals: dict[str, list] = {q: [] for q in ALL_QUEUES}
             for q_name, intervals_str in queue_lines:
                 q_key = f"GPV{q_name}"
-                if q_key in day_queues:
-                    parsed_intervals = parse_time_intervals(intervals_str)
-                    day_queues[q_key] = intervals_to_hours(parsed_intervals)
+                if q_key in queue_intervals:
+                    queue_intervals[q_key].extend(parse_time_intervals(intervals_str))
 
-            days_data[day_ts] = day_queues
+            days_data[day_ts] = {q: intervals_to_hours(iv) for q, iv in queue_intervals.items()}
             print(f"[OK] Parsed schedule for {target_date.strftime('%Y-%m-%d')} ({len(queue_lines)} queues). Updated: {update_dt}")
-        else:
-            # Check if outages do not apply to population
-            no_outages_keywords = [
-                "НЕ СТОСУЮТЬСЯ НАСЕЛЕННЯ",
-                "не заплановано",
-                "не вводитимуться",
-                "скасовано",
-                "відключення відсутні",
-                "без відключень",
-                "обмежень не передбачено",
-            ]
-            if any(k in clean_body for k in no_outages_keywords):
-                day_queues = {q: {str(i): "yes" for i in range(1, 25)} for q in ALL_QUEUES}
-                days_data[day_ts] = day_queues
-                print(f"[OK] Parsed NO outages for population on {target_date.strftime('%Y-%m-%d')}")
-                if latest_update_str is None:
-                    upd_match = re.search(r"оновлено\s*(?:о\s*)?(\d{1,2}:\d{2})", clean_title + " " + clean_body, re.IGNORECASE)
-                    if not upd_match:
-                        upd_match = re.search(r"(?:станом на|опубліковано|час[:\s]+)\s*(\d{1,2}:\d{2})", clean_body, re.IGNORECASE)
-                    upd_time = upd_match.group(1) if upd_match else "00:00"
-                    latest_update_str = f"{day_num:02d}.{month_num:02d}.{article_year} {upd_time}"
+        elif is_no_outages_notice(clean_title, clean_body):
+            days_data[day_ts] = {q: {str(i): "yes" for i in range(1, 25)} for q in ALL_QUEUES}
+            print(f"[OK] Parsed NO outages for population on {target_date.strftime('%Y-%m-%d')}")
+            if latest_update_str is None:
+                upd_match = re.search(r"оновлено\s*(?:о\s*)?(\d{1,2}:\d{2})", clean_title + " " + clean_body, re.IGNORECASE)
+                if not upd_match:
+                    upd_match = re.search(r"(?:станом на|опубліковано|час[:\s]+)\s*(\d{1,2}:\d{2})", clean_body, re.IGNORECASE)
+                latest_update_str = resolve_update_datetime(target_date, upd_match, now_kyiv)
     return days_data, latest_update_str
 
 
-def build_output_json(days_data: dict, update_str: str | None) -> dict:
+def build_output_json(days_data: dict, update_str: str | None, now_kyiv: datetime | None = None) -> dict:
     """Construct full output structure compatible with DtekAPIJson."""
-    now_kyiv = datetime.now(TZ_KYIV)
+    if now_kyiv is None:
+        now_kyiv = datetime.now(TZ_KYIV)
     today_midnight = now_kyiv.replace(hour=0, minute=0, second=0, microsecond=0)
     today_ts = int(today_midnight.timestamp())
     today_key = str(today_ts)
 
-    # Ensure today is present in data
-    if today_key not in days_data:
+    days_copy = dict(days_data)
+    today_defaulted = False
+    if today_key not in days_copy:
         print(f"[INFO] Today ({today_midnight.strftime('%Y-%m-%d')}) not explicitly in schedule; defaulting to all 'yes'")
-        days_data[today_key] = {q: {str(i): "yes" for i in range(1, 25)} for q in ALL_QUEUES}
+        days_copy[today_key] = {q: {str(i): "yes" for i in range(1, 25)} for q in ALL_QUEUES}
+        today_defaulted = True
 
     if not update_str:
         update_str = now_kyiv.strftime("%d.%m.%Y 00:00")
+    elif today_defaulted:
+        upd_dt = parse_update_datetime(update_str)
+        if upd_dt is None or (now_kyiv - upd_dt).days >= FRESH_DATA_MAX_AGE_DAYS:
+            update_str = now_kyiv.strftime("%d.%m.%Y %H:%M")
 
     # Keep only days within reasonable range (last 7 days and future days)
     min_ts = today_ts - 7 * 86400
-    filtered_days = {k: v for k, v in days_data.items() if int(k) >= min_ts}
+    filtered_days = {k: v for k, v in days_copy.items() if int(k) >= min_ts}
 
     output = {
         "regionId": "Zaporizhzhia",
@@ -305,7 +357,8 @@ def build_output_json(days_data: dict, update_str: str | None) -> dict:
 
 
 def main():
-    print(f"=== Starting ZOE Outage Parser at {datetime.now(TZ_KYIV)} ===")
+    now_kyiv = datetime.now(TZ_KYIV)
+    print(f"=== Starting ZOE Outage Parser at {now_kyiv} ===")
     script_dir = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.dirname(script_dir)
     data_dir = os.path.join(repo_root, "data")
@@ -325,7 +378,7 @@ def main():
 
     try:
         html = fetch_html_with_retries(URL_ZOE_OUTAGE)
-        days_data, update_str = parse_outages_from_html(html)
+        days_data, update_str = parse_outages_from_html(html, now_kyiv=now_kyiv)
     except Exception as e:
         print(f"[WARN] Failed to fetch {URL_ZOE_OUTAGE} directly: {e}")
 
@@ -344,14 +397,23 @@ def main():
             else:
                 days_data, update_str = fb_days, fb_update
 
+    # Midnight rollover safeguard: if sources unavailable/unchanged but calendar day advanced, roll `fact.today` forward
     if not days_data:
-        print("[WARN] No schedule data obtained from any source.")
-        if existing_data:
-            print("[INFO] Preserving existing data file.")
-            sys.exit(0)
-        sys.exit(1)
+        if existing_data and "fact" in existing_data:
+            today_ts = int(now_kyiv.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+            old_fact = existing_data.get("fact", {})
+            if old_fact.get("today") != today_ts and isinstance(old_fact.get("data"), dict):
+                print("[INFO] Calendar day rolled over while sources were unchanged; advancing fact.today.")
+                days_data = old_fact["data"]
+                update_str = old_fact.get("update")
+            else:
+                print("[INFO] No new schedule data obtained. Preserving existing data file.")
+                sys.exit(0)
+        else:
+            print("[WARN] No schedule data obtained from any source.")
+            sys.exit(1)
 
-    result = build_output_json(days_data, update_str)
+    result = build_output_json(days_data, update_str, now_kyiv=now_kyiv)
 
     # Check if schedule data actually changed (ignore lastUpdated timestamp when comparing)
     has_changed = True
@@ -359,7 +421,6 @@ def main():
         old_fact = existing_data.get("fact", {})
         new_fact = result.get("fact", {})
         if old_fact.get("data") == new_fact.get("data") and old_fact.get("today") == new_fact.get("today"):
-            # Schedule data and active day are 100% identical. Keep existing timestamps to ensure idempotency.
             old_upd_dt = old_fact.get("update", "")
             if old_upd_dt:
                 result["fact"]["update"] = old_upd_dt
@@ -367,14 +428,6 @@ def main():
                 result["lastUpdated"] = existing_data["lastUpdated"]
             has_changed = False
             print("[INFO] Schedule data and day unchanged. Preserving existing update timestamp.")
-
-    if has_changed and existing_data:
-        prev_file = os.path.join(data_dir, "Zaporizhzhiaoblenergo_prev.json")
-        try:
-            with open(prev_file, "w", encoding="utf-8") as f:
-                json.dump(existing_data, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
 
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
