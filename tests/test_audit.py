@@ -56,6 +56,26 @@ class TestParserAndRenderer(unittest.TestCase):
         self.assertIsNone(zoe_parser.parse_update_datetime("invalid date"))
         self.assertIsNone(zoe_parser.parse_update_datetime(None))
 
+    def test_normalize_source_time(self):
+        """Verify normalize_source_time shifts future same-day stamps back 1 day and rejects further future."""
+        now = datetime(2026, 11, 21, 12, 0, tzinfo=TZ_KYIV)
+        self.assertEqual(
+            zoe_parser.normalize_source_time(datetime(2026, 11, 21, 23, 45, tzinfo=TZ_KYIV), now),
+            datetime(2026, 11, 20, 23, 45, tzinfo=TZ_KYIV),
+        )
+        self.assertEqual(
+            zoe_parser.normalize_source_time(datetime(2026, 11, 21, 12, 1, tzinfo=TZ_KYIV), now),
+            datetime(2026, 11, 21, 12, 1, tzinfo=TZ_KYIV),
+        )
+        self.assertIsNone(
+            zoe_parser.normalize_source_time(datetime(2026, 11, 22, 23, 45, tzinfo=TZ_KYIV), now),
+        )
+        self.assertEqual(
+            zoe_parser.normalize_source_time(datetime(2026, 11, 21, 10, 0, tzinfo=TZ_KYIV), now),
+            datetime(2026, 11, 21, 10, 0, tzinfo=TZ_KYIV),
+        )
+        self.assertIsNone(zoe_parser.normalize_source_time(None, now))
+
     def test_html_extractor_isolation_nested_divs_and_attributes(self):
         """Verify HTMLParser prevents cross-article bleed, handles nested divs and <h2 class=...>."""
         mock_html = """
@@ -258,6 +278,9 @@ class TestParserAndRenderer(unittest.TestCase):
         saved_day = _make_day_schedule({"GPV1.1": {"11": "no"}})
         cached = zoe_parser.build_output_json({today: saved_day, tomorrow: saved_day}, "18.11.2026 09:00", now)
         cached["schedule_updates"] = {today: "18.11.2026 09:00", tomorrow: "18.11.2026 09:00"}
+        cached_with_status = zoe_parser.build_output_json({today: saved_day}, "18.11.2026 09:00", now)
+        cached_with_status["schedule_updates"] = {today: "18.11.2026 09:00"}
+        cached_with_status["availability"] = {today: "cached", tomorrow: "unpublished"}
         tomorrow_html = '<article><h2>ГПВ на 19 листопада (оновлено о 11:00)</h2><div class="content">1.1: 12:00–14:00</div></article>'
         unrelated = '<article><h2>Новини на 18 листопада</h2><div class="content">Технічні роботи скасовано.</div></article>'
         malformed = '<article><h2>ГПВ на 18 листопада</h2><div class="content"><p>1.1: з 10 до 12</p><p>1.2: з 12 до 14</p></div></article>'
@@ -278,7 +301,10 @@ class TestParserAndRenderer(unittest.TestCase):
             ("malformed schedule", malformed, None, None, "update_failed", False),
             ("malformed newest, older post follows", malformed + stale, None, None, "update_failed", False),
             ("source failure", TimeoutError(), None, None, "update_failed", False),
-            ("cached during failure", TimeoutError(), None, cached, "cached", True),
+            ("cached during failure", TimeoutError(), None, cached, None, True),
+            ("failure preserves previous availability", TimeoutError(), None, cached_with_status, "cached", True),
+            ("fallback future-stamped same day", TimeoutError(), ({today: saved_day}, "18.11.2026 23:45"), None, None, True),
+            ("fallback two days ahead rejected", TimeoutError(), ({today: saved_day}, "19.11.2026 23:45"), None, "update_failed", False),
             ("older official update", stale, None, cached, "cached", True),
             ("explicit no GPV", no_gpv, None, None, "no_gpv", True),
             ("same slots newer timestamp", TimeoutError(), ({today: saved_day}, "18.11.2026 10:00"), cached, None, True),
@@ -298,7 +324,7 @@ class TestParserAndRenderer(unittest.TestCase):
                 ):
                     zoe_parser.main()
                 result = json.loads(path.read_text(encoding="utf-8"))
-                self.assertEqual(result["availability"].get(today), expected_status)
+                self.assertEqual(result.get("availability", {}).get(today), expected_status)
                 self.assertEqual(today in result["fact"]["data"], has_today)
                 if has_today:
                     expected_day = _make_day_schedule() if expected_status == "no_gpv" else saved_day
@@ -309,6 +335,11 @@ class TestParserAndRenderer(unittest.TestCase):
                     self.assertEqual(result["fact"]["update"], "18.11.2026 00:00")
                 if name == "same slots newer timestamp":
                     self.assertEqual(result["fact"]["update"], "18.11.2026 10:00")
+                if name == "fallback future-stamped same day":
+                    self.assertEqual(result["schedule_updates"][today], "17.11.2026 23:45")
+                    self.assertEqual(result["fact"]["update"], "17.11.2026 23:45")
+                if name == "failure preserves previous availability":
+                    self.assertEqual(result["availability"].get(tomorrow), "unpublished")
 
     def test_fetch_html_with_retries_non_200(self):
         """Verify non-200 response sets error and exhausts retries cleanly."""

@@ -175,6 +175,17 @@ def parse_update_datetime(upd_str: str | None) -> datetime | None:
     return None
 
 
+def normalize_source_time(
+    dt: datetime | None,
+    now_kyiv: datetime,
+    skew: timedelta = timedelta(minutes=2),
+) -> datetime | None:
+    """Step back one day if source stamps update time with the schedule date instead of publication date."""
+    if dt and dt > now_kyiv + skew:
+        dt -= timedelta(days=1)
+    return dt if dt and dt <= now_kyiv + skew else None
+
+
 def extract_update_match(clean_title: str, clean_body: str) -> re.Match | None:
     """Extract explicit update time from article title/body without matching generic 'час' prose."""
     m = re.search(
@@ -640,8 +651,9 @@ def main():
         fallback = fetch_fallback_data()
         if fallback:
             fb_days, fb_update = fallback
-            fb_dt = parse_update_datetime(fb_update)
-            if fb_dt and fb_dt <= now_kyiv + timedelta(minutes=2):
+            fb_dt = normalize_source_time(parse_update_datetime(fb_update), now_kyiv)
+            if fb_dt:
+                fb_update_norm = fb_dt.strftime("%d.%m.%Y %H:%M")
                 for key in current_keys:
                     day = fb_days.get(key)
                     if key in days_data or not day or is_all_yes(day):
@@ -653,22 +665,28 @@ def main():
                         if not old_dt or fb_dt < old_dt or (fb_dt == old_dt and day != old_days[key]):
                             continue
                     days_data[key] = day
-                    updates[key] = fb_update
+                    updates[key] = fb_update_norm
                     print(f"[OK] Using backup schedule for {datetime.fromtimestamp(int(key), TZ_KYIV).date()}")
             else:
-                print("[WARN] Fallback has no valid source timestamp; rejected.")
+                print("[WARN] Fallback timestamp missing or in the future; rejected.")
 
     merged = merge_past_days(days_data, {"fact": {"data": old_days}}, today_ts)
     for key in merged.keys() - days_data.keys():
         if key in old_updates:
             updates[key] = old_updates[key]
-        if key in current_keys:
+        if sources_failed:
+            if key in old_availability:
+                availability[key] = old_availability[key]
+        elif key in current_keys:
             availability[key] = "no_gpv" if old_availability.get(key) == "no_gpv" else "cached"
-        elif key in old_availability and old_availability[key] == "no_gpv":
+        elif old_availability.get(key) == "no_gpv":
             availability[key] = "no_gpv"
     for key in current_keys:
         if key not in merged:
-            availability[key] = "update_failed" if sources_failed or key in metadata.get("errors", set()) else "unpublished"
+            if sources_failed and key in old_availability:
+                availability[key] = old_availability[key]
+            else:
+                availability[key] = "update_failed" if sources_failed or key in metadata.get("errors", set()) else "unpublished"
 
     # Some official notices have a date but no time. Use a stable Kyiv date for the
     # feed's freshness field and reserve schedule_updates for explicit source times.

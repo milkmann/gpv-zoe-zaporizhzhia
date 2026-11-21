@@ -82,6 +82,8 @@ jobs:
               echo "Rebase conflict detected (likely concurrent HA push); rebasing PNGs on latest remote JSON..."
               git rebase --abort || true
               git fetch origin main
+              echo "::warning::Discarding local parser commit in favour of remote (HA push):"
+              git diff --stat origin/main HEAD -- data/ images/ || true
               git reset --hard origin/main
               python scripts/render_png.py --json data/Zaporizhzhiaoblenergo.json --out images/Zaporizhzhiaoblenergo
               git add -A data/ images/
