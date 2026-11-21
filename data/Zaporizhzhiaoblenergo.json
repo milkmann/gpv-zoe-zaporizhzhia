@@ -1,6 +1,6 @@
 {
   "regionId": "Zaporizhzhia",
-  "lastUpdated": "2026-11-21T01:51:42.707871+00:00",
+  "lastUpdated": "2026-11-21T10:37:03.298116+00:00",
   "fact": {
     "data": {
       "1795212000": {
@@ -2025,8 +2025,9 @@
     }
   },
   "availability": {
-    "1795212000": "cached",
     "1795298400": "update_failed"
   },
-  "schedule_updates": {}
+  "schedule_updates": {
+    "1795212000": "20.11.2026 23:45"
+  }
 }
