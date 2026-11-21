@@ -473,6 +473,188 @@ class TestParserAndRenderer(unittest.TestCase):
         ):
             self.assertIn(token, content)
 
+    def test_telegram_extractor_synthetic(self):
+        """Verify Telegram HTML extractor order, reply exclusion, time parsing, and schedule output."""
+        tg_html = """
+        <div class="tgme_widget_message js-widget_message" data-post="Zaporizhzhyaoblenergo_news/1">
+          <div class="tgme_widget_message_text js-message_text">Загальна новина без графіку.</div>
+          <time datetime="2026-11-20T10:00:00+00:00"></time>
+        </div>
+        <div class="tgme_widget_message js-widget_message" data-post="Zaporizhzhyaoblenergo_news/2">
+          <div class="tgme_widget_message_text js-message_text">Оновлено графік погодинних відключень на 21.11.2026.<br/><br/>⚡ Черга 1.1<br/> з 03:00 до 08:00<br/> з 12:00 до 17:00<br/><br/>⚡ Черга 1.2<br/> з 03:30 до 08:30</div>
+          <time datetime="2026-11-20T21:49:31+00:00"></time>
+        </div>
+        <div class="tgme_widget_message js-widget_message" data-post="Zaporizhzhyaoblenergo_news/3">
+          <a class="tgme_widget_message_reply" href="https://t.me/Zaporizhzhyaoblenergo_news/2">
+            <div class="tgme_widget_message_text js-message_reply_text">REPLY_TEXT_MUST_IGNORE 1.1: 00:00-24:00</div>
+          </a>
+          <div class="tgme_widget_message_text js-message_text">Офіційне пояснення без графіку.</div>
+          <time datetime="2026-11-21T09:00:00+00:00"></time>
+        </div>
+        """
+        posts = zoe_parser.extract_telegram_posts(tg_html)
+        self.assertEqual(len(posts), 3)
+        self.assertNotIn("REPLY_TEXT_MUST_IGNORE", posts[0][1])
+        self.assertIn("Офіційне пояснення", posts[0][1])
+        self.assertEqual(posts[1][2], datetime(2026, 11, 20, 23, 49, 31, tzinfo=TZ_KYIV))
+        self.assertIn("1.1: з 03:00 до 08:00, з 12:00 до 17:00", posts[1][1])
+        self.assertIn("21 листопада", posts[1][1])
+
+        now = datetime(2026, 11, 21, 12, 0, tzinfo=TZ_KYIV)
+        metadata = {}
+        days, _ = zoe_parser.parse_telegram_html(tg_html, now_kyiv=now, metadata=metadata)
+        ts = str(int(datetime(2026, 11, 21, 0, 0, tzinfo=TZ_KYIV).timestamp()))
+        self.assertIn(ts, days)
+        self.assertEqual(days[ts]["GPV1.1"]["4"], "no")
+        self.assertEqual(days[ts]["GPV1.1"]["9"], "yes")
+        self.assertEqual(days[ts]["GPV1.2"]["4"], "second")
+        self.assertEqual(metadata["schedule_updates"][ts], "20.11.2026 23:49")
+
+    def test_telegram_fixture_real_page(self):
+        """Verify parsing of saved real Telegram channel HTML fixture."""
+        fixture = REPO_ROOT / "tests" / "fixtures" / "telegram_sample.html"
+        html_text = fixture.read_text(encoding="utf-8")
+        now = datetime(2026, 11, 21, 12, 0, tzinfo=TZ_KYIV)
+        days, _ = zoe_parser.parse_telegram_html(html_text, now_kyiv=now)
+        ts = str(int(datetime(2026, 11, 21, 0, 0, tzinfo=TZ_KYIV).timestamp()))
+        self.assertIn(ts, days)
+        self.assertEqual(set(days[ts]), set(zoe_parser.ALL_QUEUES))
+        for h in ("4", "5", "6", "7", "8"):
+            self.assertEqual(days[ts]["GPV1.1"][h], "no")
+        self.assertEqual(days[ts]["GPV2.1"]["1"], "no")
+
+    def test_telegram_secondary_source_and_anti_churn(self):
+        """Verify main() falls back to official Telegram when ZOE fails, and keeps HA timestamps on identical slots."""
+        now = datetime(2026, 11, 21, 12, 0, tzinfo=TZ_KYIV)
+        midnight = now.replace(hour=0)
+        today = str(int(midnight.timestamp()))
+        tomorrow = str(int((midnight + timedelta(days=1)).timestamp()))
+        tg_html = """
+        <div class="tgme_widget_message js-widget_message" data-post="Zaporizhzhyaoblenergo_news/2">
+          <div class="tgme_widget_message_text js-message_text">Оновлено графік погодинних відключень на 21.11.2026.<br/><br/>⚡ Черга 1.1<br/> з 03:00 до 08:00<br/><br/>⚡ Черга 1.2<br/> з 03:30 до 08:30</div>
+          <time datetime="2026-11-20T21:49:31+00:00"></time>
+        </div>
+        """
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now.astimezone(tz)
+
+        def fake_fetch(url, *args, **kwargs):
+            if url == zoe_parser.URL_ZOE_TELEGRAM:
+                return tg_html
+            raise TimeoutError("geo-blocked")
+
+        # Case 1: fresh fetch via Telegram secondary source
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "data" / "Zaporizhzhiaoblenergo.json"
+            with (
+                patch.object(zoe_parser, "__file__", str(Path(tmp) / "scripts" / "parser.py")),
+                patch.object(zoe_parser, "datetime", FixedDateTime),
+                patch.object(zoe_parser, "fetch_html_with_retries", side_effect=fake_fetch),
+                patch.object(zoe_parser, "fetch_fallback_data", return_value=None),
+            ):
+                zoe_parser.main()
+            result = json.loads(path.read_text(encoding="utf-8"))
+            self.assertIn(today, result["fact"]["data"])
+            self.assertEqual(result["fact"]["data"][today]["GPV1.1"]["4"], "no")
+            self.assertEqual(result["schedule_updates"][today], "20.11.2026 23:49")
+            self.assertEqual(result["fact"]["update"], "20.11.2026 23:49")
+
+            # Case 2: anti-churn — existing HA JSON with identical slots & 23:45 stays untouched
+            existing = zoe_parser.build_output_json({today: result["fact"]["data"][today]}, "20.11.2026 23:45", now)
+            existing["schedule_updates"] = {today: "20.11.2026 23:45"}
+            existing["availability"] = {tomorrow: "unpublished"}
+            original_raw = json.dumps(existing, ensure_ascii=False, indent=2)
+            path.write_text(original_raw, encoding="utf-8")
+            with (
+                patch.object(zoe_parser, "__file__", str(Path(tmp) / "scripts" / "parser.py")),
+                patch.object(zoe_parser, "datetime", FixedDateTime),
+                patch.object(zoe_parser, "fetch_html_with_retries", side_effect=fake_fetch),
+                patch.object(zoe_parser, "fetch_fallback_data", return_value=None),
+            ):
+                zoe_parser.main()
+            self.assertEqual(path.read_text(encoding="utf-8"), original_raw)
+            after = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(after["schedule_updates"][today], "20.11.2026 23:45")
+            self.assertEqual(after["availability"].get(tomorrow), "unpublished")
+
+    def test_telegram_ignores_past_days_and_picks_newest_of_tg_and_oe(self):
+        """Verify TG only affects current days and OE upgrades today only when newer than TG."""
+        now = datetime(2026, 11, 21, 12, 0, tzinfo=TZ_KYIV)
+        midnight = now.replace(hour=0)
+        yesterday = str(int((midnight - timedelta(days=1)).timestamp()))
+        today = str(int(midnight.timestamp()))
+        tg_html = """
+        <div class="tgme_widget_message js-widget_message" data-post="Zaporizhzhyaoblenergo_news/1">
+          <div class="tgme_widget_message_text js-message_text">Оновлено графік погодинних відключень на 20.11.2026.<br/><br/>⚡ Черга 1.1<br/> з 00:00 до 05:00<br/><br/>⚡ Черга 1.2<br/> з 05:00 до 10:00</div>
+          <time datetime="2026-11-20T12:00:00+00:00"></time>
+        </div>
+        <div class="tgme_widget_message js-widget_message" data-post="Zaporizhzhyaoblenergo_news/2">
+          <div class="tgme_widget_message_text js-message_text">Оновлено графік погодинних відключень на 21.11.2026.<br/><br/>⚡ Черга 1.1<br/> з 03:00 до 08:00<br/><br/>⚡ Черга 1.2<br/> з 03:30 до 08:30</div>
+          <time datetime="2026-11-20T21:49:31+00:00"></time>
+        </div>
+        """
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now.astimezone(tz)
+
+        def fake_fetch(url, *args, **kwargs):
+            if url == zoe_parser.URL_ZOE_TELEGRAM:
+                return tg_html
+            raise TimeoutError("geo-blocked")
+
+        # 1. Past days from TG ignored even when existing has no schedule_updates for yesterday
+        past_day = _make_day_schedule({"GPV6.2": {"20": "no"}})
+        oe_day = _make_day_schedule({"GPV2.2": {"10": "no"}})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "data" / "Zaporizhzhiaoblenergo.json"
+            path.parent.mkdir()
+            existing = zoe_parser.build_output_json({yesterday: past_day}, "20.11.2026 23:45", now)
+            path.write_text(json.dumps(existing), encoding="utf-8")
+            with (
+                patch.object(zoe_parser, "__file__", str(Path(tmp) / "scripts" / "parser.py")),
+                patch.object(zoe_parser, "datetime", FixedDateTime),
+                patch.object(zoe_parser, "fetch_html_with_retries", side_effect=fake_fetch),
+                patch.object(zoe_parser, "fetch_fallback_data", return_value=None),
+            ):
+                zoe_parser.main()
+            res = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(res["fact"]["data"][yesterday], past_day)
+            self.assertNotIn(yesterday, res["schedule_updates"])
+
+        # 2. OE newer than TG (21.11 11:00 vs 20.11 23:49) wins
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "data" / "Zaporizhzhiaoblenergo.json"
+            with (
+                patch.object(zoe_parser, "__file__", str(Path(tmp) / "scripts" / "parser.py")),
+                patch.object(zoe_parser, "datetime", FixedDateTime),
+                patch.object(zoe_parser, "fetch_html_with_retries", side_effect=fake_fetch),
+                patch.object(zoe_parser, "fetch_fallback_data", return_value=({today: oe_day}, "21.11.2026 11:00")),
+            ):
+                zoe_parser.main()
+            res = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(res["fact"]["data"][today], oe_day)
+            self.assertEqual(res["schedule_updates"][today], "21.11.2026 11:00")
+
+        # 3. OE older than TG (20.11 20:00 vs 20.11 23:49) loses
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "data" / "Zaporizhzhiaoblenergo.json"
+            with (
+                patch.object(zoe_parser, "__file__", str(Path(tmp) / "scripts" / "parser.py")),
+                patch.object(zoe_parser, "datetime", FixedDateTime),
+                patch.object(zoe_parser, "fetch_html_with_retries", side_effect=fake_fetch),
+                patch.object(zoe_parser, "fetch_fallback_data", return_value=({today: oe_day}, "20.11.2026 20:00")),
+            ):
+                zoe_parser.main()
+            res = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(res["fact"]["data"][today]["GPV1.1"]["4"], "no")
+            self.assertEqual(res["fact"]["data"][today]["GPV2.2"]["10"], "yes")
+            self.assertEqual(res["schedule_updates"][today], "20.11.2026 23:49")
+
 
 if __name__ == "__main__":
     unittest.main()

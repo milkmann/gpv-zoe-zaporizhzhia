@@ -59,6 +59,11 @@ jobs:
         if: github.event_name == 'push' || github.event_name == 'pull_request'
         run: python -m unittest discover -s tests -v
 
+      - name: Probe official Telegram channel
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        run: curl -fsS --max-time 15 https://t.me/s/Zaporizhzhyaoblenergo_news | grep -q tgme_widget_message_text
+
       - name: Run parser
         if: ${{ github.event_name != 'pull_request' && !(github.event_name == 'workflow_dispatch' && inputs.skip_parser) }}
         run: python scripts/parser.py

@@ -25,6 +25,7 @@ MONTHS_UA = {
     "вересня": 9, "жовтня": 10, "листопада": 11, "грудня": 12,
 }
 MONTH_PATTERN = "|".join(MONTHS_UA.keys())
+MONTHS_UA_BY_NUM = {v: k for k, v in MONTHS_UA.items()}
 DATE_RE = re.compile(rf"(?<!\d)(\d{{1,2}})\s+({MONTH_PATTERN})\b", re.IGNORECASE)
 
 ALL_QUEUES = [
@@ -56,6 +57,7 @@ DEFAULT_TIME_TYPE = {
 }
 
 URL_ZOE_OUTAGE = "https://www.zoe.com.ua/outage/"
+URL_ZOE_TELEGRAM = "https://t.me/s/Zaporizhzhyaoblenergo_news"
 FALLBACK_URL = "https://raw.githubusercontent.com/yaroslav2901/OE_OUTAGE_DATA/main/data/Zaporizhzhiaoblenergo.json"
 VALID_SLOT_STATES = {"yes", "no", "maybe", "first", "second", "mfirst", "msecond"}
 HOUR_KEYS = set(DEFAULT_TIME_ZONE)
@@ -139,6 +141,151 @@ def extract_articles(html_text: str) -> list[tuple[str, str]]:
     parser.feed(html_text)
     parser.close()
     return parser.articles
+
+
+class _TelegramExtractor(HTMLParser):
+    """Stdlib HTML parser that extracts (raw_text, published_kyiv) per post from t.me/s/ HTML."""
+
+    BLOCK_TAGS = {"p", "div", "li", "tr"}
+    TG_HEADER_RE = re.compile(r"^[^\w]*черг[аи]\s+([1-6]\.[1-2])\s*:?\s*(.*)$", re.IGNORECASE)
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.posts: list[tuple[str, datetime | None]] = []
+        self._in_post = False
+        self._text_depth = 0
+        self._reply_depth = 0
+        self._text_parts: list[str] = []
+        self._published: datetime | None = None
+
+    def _flush_post(self):
+        if self._in_post:
+            text = "".join(self._text_parts)
+            if text.strip():
+                self.posts.append((text, self._published))
+        self._in_post = False
+        self._text_depth = 0
+        self._reply_depth = 0
+        self._text_parts = []
+        self._published = None
+
+    def close(self):
+        super().close()
+        self._flush_post()
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]):
+        t = tag.lower()
+        attr_map = dict(attrs)
+        if t == "div" and "data-post" in attr_map:
+            self._flush_post()
+            self._in_post = True
+            return
+        if not self._in_post:
+            return
+        if self._reply_depth > 0:
+            if t in ("a", "div"):
+                self._reply_depth += 1
+            return
+        classes = (attr_map.get("class") or "").split()
+        if t in ("a", "div") and "tgme_widget_message_reply" in classes:
+            self._reply_depth = 1
+            return
+        if t == "time" and self._published is None:
+            dt_raw = attr_map.get("datetime")
+            if dt_raw:
+                try:
+                    dt = datetime.fromisoformat(dt_raw)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=TZ_KYIV)
+                    self._published = dt.astimezone(TZ_KYIV)
+                except ValueError:
+                    pass
+            return
+        if t == "div":
+            if self._text_depth > 0:
+                self._text_depth += 1
+                self._text_parts.append("\n")
+            elif "tgme_widget_message_text" in classes:
+                self._text_depth = 1
+            return
+        if self._text_depth > 0 and (t == "br" or t in self.BLOCK_TAGS):
+            self._text_parts.append("\n")
+
+    def handle_endtag(self, tag: str):
+        t = tag.lower()
+        if not self._in_post:
+            return
+        if self._reply_depth > 0:
+            if t in ("a", "div"):
+                self._reply_depth -= 1
+            return
+        if t == "div" and self._text_depth > 0:
+            self._text_depth -= 1
+            if self._text_depth > 0:
+                self._text_parts.append("\n")
+        elif self._text_depth > 0 and t in self.BLOCK_TAGS:
+            self._text_parts.append("\n")
+
+    def handle_data(self, data: str):
+        if self._in_post and self._reply_depth == 0 and self._text_depth > 0:
+            self._text_parts.append(data)
+
+
+def normalize_telegram_text(text: str) -> tuple[str, str]:
+    """Convert Telegram channel post formatting into (title, body) compatible with parse_articles."""
+    def _replace_numeric_date(m: re.Match) -> str:
+        month_name = MONTHS_UA_BY_NUM.get(int(m.group(2)))
+        return f"{int(m.group(1))} {month_name}" if month_name else m.group(0)
+
+    text = re.sub(r"(?<!\d)(\d{1,2})\.(\d{1,2})\.(20\d{2})(?!\d)", _replace_numeric_date, text)
+
+    out_lines: list[str] = []
+    current_q: str | None = None
+    current_intervals: list[str] = []
+
+    def _flush_queue():
+        nonlocal current_q, current_intervals
+        if current_q is not None:
+            if current_intervals:
+                out_lines.append(f"{current_q}: {', '.join(current_intervals)}")
+            current_q = None
+            current_intervals = []
+
+    for raw_line in text.splitlines():
+        line = raw_line.replace("\xa0", " ").strip()
+        if not line:
+            _flush_queue()
+            out_lines.append("")
+            continue
+        m = _TelegramExtractor.TG_HEADER_RE.match(line)
+        if m:
+            _flush_queue()
+            current_q = m.group(1)
+            trailing = m.group(2).strip()
+            if trailing:
+                current_intervals.append(trailing)
+            continue
+        if current_q is not None:
+            current_intervals.append(line)
+        else:
+            out_lines.append(line)
+    _flush_queue()
+
+    normalized = "\n".join(out_lines)
+    title = next((ln.strip() for ln in out_lines if ln.strip()), "")
+    return title, normalized
+
+
+def extract_telegram_posts(html_text: str) -> list[tuple[str, str, datetime | None]]:
+    """Extract normalized (title, body, published_kyiv) posts newest-first from t.me/s/ HTML."""
+    extractor = _TelegramExtractor()
+    extractor.feed(html_text)
+    extractor.close()
+    posts: list[tuple[str, str, datetime | None]] = []
+    for raw_text, published in reversed(extractor.posts):
+        title, body = normalize_telegram_text(raw_text)
+        posts.append((title, body, published))
+    return posts
 
 
 def atomic_write_json(path: str, data: dict) -> None:
@@ -429,9 +576,12 @@ def intervals_to_hours(intervals: list[tuple[tuple[int, int], tuple[int, int]]])
     return hours
 
 
-def parse_outages_from_html(html: str, now_kyiv: datetime | None = None, metadata: dict | None = None) -> tuple[dict, str | None]:
-    """Parse articles from HTML and build fact schedule data and latest update timestamp."""
-    articles = extract_articles(html)
+def parse_articles(
+    articles: list[tuple[str, str]] | list[tuple[str, str, datetime | None]],
+    now_kyiv: datetime | None = None,
+    metadata: dict | None = None,
+) -> tuple[dict, str | None]:
+    """Parse extracted (title, body[, published]) items into fact schedule data."""
     print(f"[INFO] Found {len(articles)} articles on page.")
 
     if now_kyiv is None:
@@ -446,7 +596,13 @@ def parse_outages_from_html(html: str, now_kyiv: datetime | None = None, metadat
     metadata.setdefault("errors", set())
     metadata["article_count"] = len(articles)
 
-    for clean_title, clean_body in articles:
+    for item in articles:
+        if len(item) == 3:
+            clean_title, clean_body, published = item
+        else:
+            clean_title, clean_body = item
+            published = None
+
         date_match = DATE_RE.search(clean_title) or DATE_RE.search(clean_body)
         if not date_match:
             continue
@@ -506,31 +662,51 @@ def parse_outages_from_html(html: str, now_kyiv: datetime | None = None, metadat
             if len(matched_queues) == 1 and (total_intervals == 0 or not is_gpv_article):
                 continue
 
-            upd_match = extract_update_match(clean_title, clean_body)
-            update_dt = resolve_update_datetime(target_date, upd_match, now_kyiv)
+            if published is not None:
+                update_dt = published.strftime("%d.%m.%Y %H:%M")
+                has_explicit_upd = True
+            else:
+                upd_match = extract_update_match(clean_title, clean_body)
+                update_dt = resolve_update_datetime(target_date, upd_match, now_kyiv)
+                has_explicit_upd = bool(upd_match)
 
             if latest_update_str is None:
                 latest_update_str = update_dt
 
             days_data[day_ts] = {q: intervals_to_hours(iv) for q, iv in queue_intervals.items()}
-            metadata["schedule_updates"][day_ts] = update_dt if upd_match else None
+            metadata["schedule_updates"][day_ts] = update_dt if has_explicit_upd else None
             print(f"[OK] Parsed schedule for {target_date.strftime('%Y-%m-%d')} ({len(matched_queues)} queues). Updated: {update_dt}")
         elif is_no_outages_notice(clean_title, clean_body):
             no_gpv_day = {q: dict.fromkeys(DEFAULT_TIME_ZONE, "yes") for q in ALL_QUEUES}
-            match = extract_update_match(clean_title, clean_body)
+            match = None if published is not None else extract_update_match(clean_title, clean_body)
             for day in notice_dates(clean_title, clean_body, now_kyiv):
                 key = str(int(day.timestamp()))
                 if key in days_data or key in metadata["errors"]:
                     continue
                 days_data[key] = no_gpv_day
                 metadata["availability"][key] = "no_gpv"
-                metadata["schedule_updates"][key] = resolve_update_datetime(day, match, now_kyiv) if match else None
+                if published is not None:
+                    upd_dt = published.strftime("%d.%m.%Y %H:%M")
+                    metadata["schedule_updates"][key] = upd_dt
+                else:
+                    upd_dt = resolve_update_datetime(day, match, now_kyiv)
+                    metadata["schedule_updates"][key] = upd_dt if match else None
                 print(f"[OK] Parsed NO outages for population on {day.date()}")
                 if latest_update_str is None:
-                    latest_update_str = resolve_update_datetime(day, match, now_kyiv)
+                    latest_update_str = upd_dt
         elif GPV_RE.search(clean_title):
             metadata["errors"].add(day_ts)
     return days_data, latest_update_str
+
+
+def parse_outages_from_html(html: str, now_kyiv: datetime | None = None, metadata: dict | None = None) -> tuple[dict, str | None]:
+    """Parse articles from HTML and build fact schedule data and latest update timestamp."""
+    return parse_articles(extract_articles(html), now_kyiv=now_kyiv, metadata=metadata)
+
+
+def parse_telegram_html(html: str, now_kyiv: datetime | None = None, metadata: dict | None = None) -> tuple[dict, str | None]:
+    """Parse posts from official ZOE Telegram web preview HTML."""
+    return parse_articles(extract_telegram_posts(html), now_kyiv=now_kyiv, metadata=metadata)
 
 
 def build_output_json(
@@ -614,9 +790,31 @@ def main():
         sources_failed = True
         print(f"[WARN] Failed to fetch {URL_ZOE_OUTAGE} directly: {e}")
 
+    used_secondary = False
+    if sources_failed:
+        try:
+            tg_html = fetch_html_with_retries(URL_ZOE_TELEGRAM, retries=2, timeout=15)
+            metadata = {}
+            days_data, _ = parse_telegram_html(tg_html, now_kyiv=now_kyiv, metadata=metadata)
+            sources_failed = not metadata["article_count"]
+            used_secondary = not sources_failed
+            if used_secondary:
+                print(f"[OK] Using official ZOE Telegram channel ({len(days_data)} days)")
+        except Exception as e:
+            print(f"[WARN] Telegram source failed: {e}")
+
     midnight = now_kyiv.replace(hour=0, minute=0, second=0, microsecond=0)
     today_ts = int(midnight.timestamp())
     current_keys = (str(today_ts), str(int((midnight + timedelta(days=1)).timestamp())))
+    if used_secondary:
+        days_data = {k: v for k, v in days_data.items() if k in current_keys}
+        for k in list(metadata.get("schedule_updates", {})):
+            if k not in days_data:
+                metadata["schedule_updates"].pop(k)
+        for k in list(metadata.get("availability", {})):
+            if k not in days_data:
+                metadata["availability"].pop(k)
+
     old_fact = existing_data.get("fact", {}) if isinstance(existing_data, dict) else {}
     old_fact = old_fact if isinstance(old_fact, dict) else {}
     old_updates = existing_data.get("schedule_updates", {}) if isinstance(existing_data, dict) else {}
@@ -635,6 +833,14 @@ def main():
     availability = metadata.setdefault("availability", {})
     old_update = parse_update_datetime(old_fact.get("update"))
 
+    if used_secondary:
+        for key in list(days_data.keys() & old_days.keys()):
+            if days_data[key] == old_days[key]:
+                if old_updates.get(key):
+                    updates[key] = old_updates[key]
+                else:
+                    updates.pop(key, None)
+
     for key in list(days_data.keys() & old_days.keys()):
         old_dt = parse_update_datetime(old_updates.get(key))
         if not old_dt and key == str(old_fact.get("today")):
@@ -645,8 +851,8 @@ def main():
             updates.pop(key, None)
             availability.pop(key, None)
 
-    # Use fallback for missing current dates even when another official day parsed.
-    if any(key not in days_data for key in current_keys):
+    # Use fallback for missing current dates, or to upgrade Telegram if OE_OUTAGE_DATA is newer.
+    if used_secondary or any(key not in days_data for key in current_keys):
         print("[INFO] Attempting fallback data source...")
         fallback = fetch_fallback_data()
         if fallback:
@@ -656,8 +862,18 @@ def main():
                 fb_update_norm = fb_dt.strftime("%d.%m.%Y %H:%M")
                 for key in current_keys:
                     day = fb_days.get(key)
-                    if key in days_data or not day or is_all_yes(day):
+                    if not day or is_all_yes(day):
                         continue
+                    replaced_tg = False
+                    if key in days_data:
+                        if not used_secondary:
+                            continue
+                        tg_dt = parse_update_datetime(updates.get(key))
+                        if tg_dt and fb_dt <= tg_dt:
+                            continue
+                        if day == days_data[key]:
+                            continue
+                        replaced_tg = True
                     old_dt = parse_update_datetime(old_updates.get(key))
                     if key in old_days:
                         if not old_dt and key == str(old_fact.get("today")):
@@ -666,7 +882,10 @@ def main():
                             continue
                     days_data[key] = day
                     updates[key] = fb_update_norm
-                    print(f"[OK] Using backup schedule for {datetime.fromtimestamp(int(key), TZ_KYIV).date()}")
+                    if replaced_tg:
+                        availability.pop(key, None)
+                    suffix = " (newer than Telegram)" if replaced_tg else ""
+                    print(f"[OK] Using backup schedule for {datetime.fromtimestamp(int(key), TZ_KYIV).date()}{suffix}")
             else:
                 print("[WARN] Fallback timestamp missing or in the future; rejected.")
 
@@ -674,7 +893,7 @@ def main():
     for key in merged.keys() - days_data.keys():
         if key in old_updates:
             updates[key] = old_updates[key]
-        if sources_failed:
+        if sources_failed or used_secondary:
             if key in old_availability:
                 availability[key] = old_availability[key]
         elif key in current_keys:
@@ -683,7 +902,7 @@ def main():
             availability[key] = "no_gpv"
     for key in current_keys:
         if key not in merged:
-            if sources_failed and key in old_availability:
+            if (sources_failed or used_secondary) and key in old_availability:
                 availability[key] = old_availability[key]
             else:
                 availability[key] = "update_failed" if sources_failed or key in metadata.get("errors", set()) else "unpublished"
